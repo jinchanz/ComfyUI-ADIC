@@ -543,13 +543,241 @@ class LoadImagesFromUrls:
             return False
 
 
+class PythonCodeExecutor:
+    """Python代码执行器节点"""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "code": ("STRING", {"multiline": True, "default": """# 在这里编写Python代码
+# 可用变量：
+# - input1, input2, input3: 输入数据
+# - json, re: 预导入的模块
+# 
+# 示例：将换行分割的字符串转换为JSON数组
+# lines = input1.strip().split('\\n')
+# result = [line.strip() for line in lines if line.strip()]
+# output = json.dumps(result, ensure_ascii=False)
+
+# 请将最终结果赋值给 'output' 变量
+output = "请在上方编写代码"
+"""}),
+            },
+            "optional": {
+                "input1": ("STRING", {"default": "", "forceInput": True}),
+                "input2": ("STRING", {"default": "", "forceInput": True}),
+                "input3": ("STRING", {"default": "", "forceInput": True}),
+                "safe_mode": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("output", "logs")
+
+    FUNCTION = "execute_code"
+
+    OUTPUT_NODE = False
+
+    CATEGORY = "Malette"
+
+    def execute_code(self, code, input1="", input2="", input3="", safe_mode=True):
+        """执行Python代码"""
+        import re
+        import math
+        import random
+        from datetime import datetime, timedelta
+        
+        try:
+            # 准备执行环境
+            local_vars = {
+                'input1': input1,
+                'input2': input2, 
+                'input3': input3,
+                'json': json,
+                're': re,
+                'math': math,
+                'random': random,
+                'datetime': datetime,
+                'timedelta': timedelta,
+                'len': len,
+                'str': str,
+                'int': int,
+                'float': float,
+                'list': list,
+                'dict': dict,
+                'tuple': tuple,
+                'set': set,
+                'range': range,
+                'enumerate': enumerate,
+                'zip': zip,
+                'map': map,
+                'filter': filter,
+                'sorted': sorted,
+                'max': max,
+                'min': min,
+                'sum': sum,
+                'any': any,
+                'all': all,
+                'print': print,
+                'output': None
+            }
+            
+            # 安全模式检查
+            if safe_mode:
+                dangerous_keywords = [
+                    'import os', 'import sys', 'import subprocess', 'import shutil',
+                    '__import__', 'eval', 'exec', 'compile', 'open', 'file',
+                    'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
+                    'getattr', 'setattr', 'delattr', 'hasattr'
+                ]
+                
+                code_lower = code.lower()
+                for keyword in dangerous_keywords:
+                    if keyword in code_lower:
+                        return (json.dumps({"error": f"安全模式禁止使用: {keyword}"}, ensure_ascii=False), 
+                               f"[PythonCodeExecutor] 安全检查失败: 发现禁用关键词 '{keyword}'")
+            
+            # 捕获print输出
+            import io
+            import sys
+            old_stdout = sys.stdout
+            sys.stdout = captured_output = io.StringIO()
+            
+            logs = []
+            logs.append(f"[PythonCodeExecutor] 开始执行代码，安全模式: {'开启' if safe_mode else '关闭'}")
+            logs.append(f"[PythonCodeExecutor] 输入数据:")
+            logs.append(f"  input1: {repr(input1[:100])}{'...' if len(input1) > 100 else ''}")
+            logs.append(f"  input2: {repr(input2[:100])}{'...' if len(input2) > 100 else ''}")
+            logs.append(f"  input3: {repr(input3[:100])}{'...' if len(input3) > 100 else ''}")
+            
+            # 执行用户代码
+            exec(code, {"__builtins__": {}}, local_vars)
+            
+            # 恢复stdout
+            sys.stdout = old_stdout
+            captured_print = captured_output.getvalue()
+            
+            # 获取输出结果
+            result = local_vars.get('output', None)
+            
+            if result is None:
+                logs.append("[PythonCodeExecutor] 警告: 代码未设置output变量")
+                output_str = json.dumps({"warning": "代码未设置output变量"}, ensure_ascii=False)
+            else:
+                # 将结果转换为字符串
+                if isinstance(result, str):
+                    output_str = result
+                else:
+                    try:
+                        output_str = json.dumps(result, ensure_ascii=False, indent=2)
+                    except:
+                        output_str = str(result)
+                
+                logs.append(f"[PythonCodeExecutor] 代码执行成功")
+                logs.append(f"[PythonCodeExecutor] 输出类型: {type(result).__name__}")
+                logs.append(f"[PythonCodeExecutor] 输出长度: {len(output_str)} 字符")
+            
+            # 添加print输出到日志
+            if captured_print:
+                logs.append("[PythonCodeExecutor] Print输出:")
+                for line in captured_print.strip().split('\n'):
+                    logs.append(f"  {line}")
+            
+            log_output = '\n'.join(logs)
+            
+            return (output_str, log_output)
+            
+        except SyntaxError as e:
+            error_msg = f"语法错误: {str(e)}"
+            log_output = f"[PythonCodeExecutor] {error_msg}\n在第 {e.lineno} 行: {e.text}"
+            return (json.dumps({"error": error_msg}, ensure_ascii=False), log_output)
+            
+        except Exception as e:
+            error_msg = f"执行错误: {str(e)}"
+            log_output = f"[PythonCodeExecutor] {error_msg}"
+            return (json.dumps({"error": error_msg}, ensure_ascii=False), log_output)
+        
+        finally:
+            # 确保恢复stdout
+            if 'old_stdout' in locals():
+                sys.stdout = old_stdout
+
+
+class StringToJsonArray:
+    """字符串转JSON数组节点（快捷版本）"""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True, "multiline": True}),
+            },
+            "optional": {
+                "separator": (["newline", "comma", "semicolon", "pipe", "tab"], {"default": "newline"}),
+                "remove_empty": ("BOOLEAN", {"default": True}),
+                "trim_whitespace": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("json_array",)
+
+    FUNCTION = "convert"
+
+    OUTPUT_NODE = False
+
+    CATEGORY = "Malette"
+
+    def convert(self, text, separator="newline", remove_empty=True, trim_whitespace=True):
+        """将字符串转换为JSON数组"""
+        try:
+            if not text:
+                return (json.dumps([], ensure_ascii=False),)
+            
+            # 选择分隔符
+            separators = {
+                "newline": "\n",
+                "comma": ",",
+                "semicolon": ";",
+                "pipe": "|",
+                "tab": "\t"
+            }
+            
+            sep = separators.get(separator, "\n")
+            
+            # 分割字符串
+            items = text.split(sep)
+            
+            # 处理选项
+            if trim_whitespace:
+                items = [item.strip() for item in items]
+            
+            if remove_empty:
+                items = [item for item in items if item]
+            
+            # 转换为JSON
+            result = json.dumps(items, ensure_ascii=False, indent=2)
+            
+            print(f"[StringToJsonArray] 转换了 {len(items)} 个项目，分隔符: {separator}")
+            
+            return (result,)
+            
+        except Exception as e:
+            error_msg = f"转换失败: {str(e)}"
+            print(f"[StringToJsonArray] {error_msg}")
+            return (json.dumps({"error": error_msg}, ensure_ascii=False),)
+
+
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "ImageTranslateAPI": ImageTranslateAPI,
     "ImageTranslateParamsBuilder": ImageTranslateParamsBuilder,
     "ImageTranslateResultExtractor": ImageTranslateResultExtractor,
     "ADIC_COMMON_API": ADIC_COMMON_API,
-    "LoadImagesFromUrls": LoadImagesFromUrls
+    "LoadImagesFromUrls": LoadImagesFromUrls,
+    "PythonCodeExecutor": PythonCodeExecutor,
+    "StringToJsonArray": StringToJsonArray
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -557,5 +785,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageTranslateParamsBuilder": "图片翻译参数构建器",
     "ImageTranslateResultExtractor": "图片翻译结果提取器",
     "ADIC_COMMON_API": "ADIC Common API",
-    "LoadImagesFromUrls": "从URL列表加载图片"
+    "LoadImagesFromUrls": "从URL列表加载图片",
+    "PythonCodeExecutor": "Python代码执行器",
+    "StringToJsonArray": "字符串转JSON数组"
 } 
