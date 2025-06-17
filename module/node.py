@@ -1,6 +1,11 @@
 import json
 import requests
 from typing import List, Dict, Any
+import torch
+import numpy as np
+from PIL import Image
+import io
+from urllib.parse import urlparse
 
 
 
@@ -143,29 +148,6 @@ class ImageTranslateAPI:
                 else:
                     request_body = params
                 
-                # 验证params格式
-                if not isinstance(request_body, dict) or "params" not in request_body:
-                    raise ValueError("params参数格式错误，应该包含params数组")
-                
-                params_array = request_body["params"]
-                if not isinstance(params_array, list):
-                    raise ValueError("params.params 应该是一个数组")
-                
-                if len(params_array) == 0:
-                    raise ValueError("params数组不能为空")
-                
-                # 验证每个参数项
-                for i, param in enumerate(params_array):
-                    if not isinstance(param, dict):
-                        raise ValueError(f"params[{i}] 应该是一个对象")
-                    
-                    if "url" not in param or not param["url"]:
-                        raise ValueError(f"params[{i}] 缺少必需的url字段")
-                    
-                    url = param["url"].strip()
-                    if not (url.startswith('http://') or url.startswith('https://')):
-                        raise ValueError(f"params[{i}] url格式不正确: {url}")
-                
             except json.JSONDecodeError as e:
                 raise ValueError(f"params参数JSON解析失败: {str(e)}")
             
@@ -177,7 +159,6 @@ class ImageTranslateAPI:
                 "X-App-Name": app_name.strip()
             }
             
-            print(f"[ImageTranslateAPI] 发送翻译请求，图片数量: {len(params_array)}")
             print(f"[ImageTranslateAPI] 请求参数: {json.dumps(request_body, ensure_ascii=False)}")
             
             # 发送POST请求
@@ -386,17 +367,195 @@ class ImageTranslateResultExtractor:
             return (json.dumps({"error": error_msg}, ensure_ascii=False),)
 
 
+class LoadImagesFromUrls:
+    """从URL列表加载图片节点"""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "urls": ("STRING", {"forceInput": True, "multiline": True}),
+            },
+            "optional": {
+                "input_format": (["json_array", "newline_separated", "auto"], {"default": "auto"}),
+                "max_images": ("INT", {"default": 10, "min": 1, "max": 50}),
+                "timeout": ("INT", {"default": 30, "min": 5, "max": 300}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT")
+    RETURN_NAMES = ("images", "loaded_urls", "count")
+    
+    OUTPUT_IS_LIST = (True, False, False)
+
+    FUNCTION = "load_images"
+
+    OUTPUT_NODE = False
+
+    CATEGORY = "Malette"
+
+    def load_images(self, urls, input_format="auto", max_images=10, timeout=30):
+        """从URL列表加载图片"""
+        try:
+            # 解析URL列表
+            url_list = self._parse_urls(urls, input_format)
+            
+            if not url_list:
+                print("[LoadImagesFromUrls] 警告: 没有找到有效的URL")
+                # 返回空图片数据
+                empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                return (empty_image, json.dumps([]), 0)
+            
+            # 限制图片数量
+            url_list = url_list[:max_images]
+            
+            loaded_images = []
+            loaded_urls = []
+            
+            print(f"[LoadImagesFromUrls] 开始加载 {len(url_list)} 张图片")
+            
+            for i, url in enumerate(url_list):
+                try:
+                    print(f"[LoadImagesFromUrls] 正在加载第 {i+1}/{len(url_list)} 张图片: {url}")
+                    
+                    # 验证URL格式
+                    if not self._is_valid_url(url):
+                        print(f"[LoadImagesFromUrls] 跳过无效URL: {url}")
+                        continue
+                    
+                    # 下载图片
+                    response = requests.get(
+                        url, 
+                        timeout=timeout,
+                        headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        },
+                        verify=False
+                    )
+                    response.raise_for_status()
+                    
+                    # 检查内容类型
+                    content_type = response.headers.get('content-type', '')
+                    if not content_type.startswith('image/'):
+                        print(f"[LoadImagesFromUrls] 跳过非图片内容: {url}, content-type: {content_type}")
+                        continue
+                    
+                    # 将响应内容转换为PIL图片
+                    image = Image.open(io.BytesIO(response.content))
+                    
+                    # 确保图片是RGB模式
+                    if image.mode != 'RGB':
+                        image = image.convert('RGB')
+                    
+                    # 转换为numpy数组
+                    image_np = np.array(image).astype(np.float32) / 255.0
+                    
+                    # 转换为torch张量 (H, W, C)
+                    image_tensor = torch.from_numpy(image_np)
+                    
+                    loaded_images.append(image_tensor)
+                    loaded_urls.append(url)
+                    
+                    print(f"[LoadImagesFromUrls] 成功加载图片: {image.size}, 模式: {image.mode}")
+                    
+                except requests.exceptions.RequestException as e:
+                    print(f"[LoadImagesFromUrls] 下载图片失败 {url}: {str(e)}")
+                    continue
+                except Exception as e:
+                    print(f"[LoadImagesFromUrls] 处理图片失败 {url}: {str(e)}")
+                    continue
+            
+            if not loaded_images:
+                print("[LoadImagesFromUrls] 警告: 没有成功加载任何图片")
+                # 返回空图片列表
+                empty_image = torch.zeros((64, 64, 3), dtype=torch.float32)
+                return ([empty_image], json.dumps([]), 0)
+            
+            # 保持原始尺寸，将每张图片作为独立的张量返回
+            # 为每张图片添加batch维度，但保持原始尺寸
+            output_images = []
+            for i, img_tensor in enumerate(loaded_images):
+                # 图片格式为 (H, W, C)，添加batch维度变为 (1, H, W, C)
+                batched_img = img_tensor.unsqueeze(0)
+                output_images.append(batched_img)
+                print(f"  图片 {i+1}: {img_tensor.shape[1]}x{img_tensor.shape[0]} (WxH)")
+            
+            print(f"[LoadImagesFromUrls] 成功加载 {len(loaded_images)} 张图片，保持原始尺寸")
+            
+            return (output_images, json.dumps(loaded_urls, ensure_ascii=False), len(loaded_images))
+            
+        except Exception as e:
+            error_msg = f"加载图片过程出错: {str(e)}"
+            print(f"[LoadImagesFromUrls] {error_msg}")
+            # 返回错误时的默认数据
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return ([empty_image], json.dumps({"error": error_msg}, ensure_ascii=False), 0)
+    
+    def _parse_urls(self, urls_input, input_format):
+        """解析URL输入"""
+        urls_input = urls_input.strip()
+        if not urls_input:
+            return []
+        
+        url_list = []
+        
+        if input_format == "auto":
+            # 自动检测格式
+            try:
+                # 尝试解析为JSON
+                parsed = json.loads(urls_input)
+                if isinstance(parsed, list):
+                    url_list = [str(url).strip() for url in parsed if str(url).strip()]
+                    print("[LoadImagesFromUrls] 检测到JSON数组格式")
+                else:
+                    raise ValueError("JSON不是数组格式")
+            except:
+                # 解析为换行分隔
+                url_list = [line.strip() for line in urls_input.split('\n') if line.strip()]
+                print("[LoadImagesFromUrls] 检测到换行分隔格式")
+        
+        elif input_format == "json_array":
+            try:
+                parsed = json.loads(urls_input)
+                if isinstance(parsed, list):
+                    url_list = [str(url).strip() for url in parsed if str(url).strip()]
+                else:
+                    raise ValueError("JSON格式错误：不是数组")
+            except Exception as e:
+                print(f"[LoadImagesFromUrls] JSON解析失败: {str(e)}")
+                return []
+        
+        elif input_format == "newline_separated":
+            url_list = [line.strip() for line in urls_input.split('\n') if line.strip()]
+        
+        # 过滤有效的URL
+        valid_urls = [url for url in url_list if self._is_valid_url(url)]
+        
+        print(f"[LoadImagesFromUrls] 解析得到 {len(valid_urls)} 个有效URL")
+        return valid_urls
+    
+    def _is_valid_url(self, url):
+        """验证URL格式"""
+        try:
+            result = urlparse(url)
+            return all([result.scheme in ['http', 'https'], result.netloc])
+        except:
+            return False
+
+
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "ImageTranslateAPI": ImageTranslateAPI,
     "ImageTranslateParamsBuilder": ImageTranslateParamsBuilder,
     "ImageTranslateResultExtractor": ImageTranslateResultExtractor,
-    "ADIC_COMMON_API": ADIC_COMMON_API
+    "ADIC_COMMON_API": ADIC_COMMON_API,
+    "LoadImagesFromUrls": LoadImagesFromUrls
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageTranslateAPI": "图片翻译 API",
     "ImageTranslateParamsBuilder": "图片翻译参数构建器",
     "ImageTranslateResultExtractor": "图片翻译结果提取器",
-    "ADIC_COMMON_API": "ADIC Common API"
+    "ADIC_COMMON_API": "ADIC Common API",
+    "LoadImagesFromUrls": "从URL列表加载图片"
 } 
