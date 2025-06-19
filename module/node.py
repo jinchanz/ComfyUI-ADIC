@@ -175,6 +175,8 @@ class ImageTranslateAPI:
             
             # 解析响应
             response_data = response.json()
+
+            print(f"[ImageTranslateAPI] 响应数据: {response_data}")
             
             # 检查业务状态
             if not response_data.get("success", False):
@@ -769,6 +771,225 @@ class StringToJsonArray:
             return (json.dumps({"error": error_msg}, ensure_ascii=False),)
 
 
+class MarketImageGenerateWithPolling:
+    """营销图生图任务创建与轮询节点"""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "generate_params": ("STRING", {"forceInput": True, "multiline": True}),
+                "app_name": ("STRING", {"default": "NHCI"}),
+                "api_key": ("STRING", {"default": ""}),
+                "user_id": ("STRING", {"default": ""}),
+                "base_url": ("STRING", {"default": "https://pre-zhimei.alibabadesign.com"}),
+            },
+            "optional": {
+                "poll_interval": ("INT", {"default": 5, "min": 1, "max": 60}),
+                "max_poll_time": ("INT", {"default": 300, "min": 30, "max": 1800}),
+                "auto_start_polling": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("result", "task_id", "status")
+
+    FUNCTION = "execute_task"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "Malette"
+
+    def execute_task(self, generate_params, app_name, api_key, user_id, base_url, 
+                     poll_interval=5, max_poll_time=300, auto_start_polling=True):
+        """执行营销图生图任务并轮询结果"""
+        import time
+        
+        try:
+            # 验证必填参数
+            if not api_key or api_key.strip() == "":
+                raise ValueError("API密钥不能为空")
+            
+            if not user_id or user_id.strip() == "":
+                raise ValueError("用户ID不能为空")
+            
+            # 解析生成参数
+            try:
+                if isinstance(generate_params, str):
+                    request_body = json.loads(generate_params)
+                else:
+                    request_body = generate_params
+            except json.JSONDecodeError as e:
+                raise ValueError(f"生成参数JSON解析失败: {str(e)}")
+            
+            # 设置请求头
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Authorization": f"Bearer {api_key.strip()}",
+                "X-App-Name": app_name.strip()
+            }
+            
+            # 步骤1: 创建营销图生图任务
+            create_url = f"{base_url.rstrip('/')}/open/api/v1/ai/marketImageGenerate"
+            
+            print(f"[MarketImageGenerateWithPolling] 创建任务...")
+            print(f"[MarketImageGenerateWithPolling] 请求URL: {create_url}")
+            print(f"[MarketImageGenerateWithPolling] 请求参数: {json.dumps(request_body, ensure_ascii=False)}")
+            
+            # 发送创建任务请求
+            response = requests.post(
+                create_url,
+                headers=headers,
+                json=request_body,
+                timeout=60,
+                verify=False
+            )
+            
+            response.raise_for_status()
+            create_response = response.json()
+            
+            print(f"[MarketImageGenerateWithPolling] 创建任务响应: {json.dumps(create_response, ensure_ascii=False)}")
+            
+            # 检查创建任务是否成功
+            if not create_response.get("success", False):
+                error_msg = create_response.get("message", "创建任务失败")
+                return (
+                    json.dumps({"error": error_msg, "code": create_response.get("code", -1)}, ensure_ascii=False),
+                    "",
+                    "failed"
+                )
+            
+            # 获取任务ID
+            task_id = create_response.get("data")
+            if not task_id:
+                return (
+                    json.dumps({"error": "未获取到任务ID"}, ensure_ascii=False),
+                    "",
+                    "failed"
+                )
+            
+            task_id_str = str(task_id)
+            print(f"[MarketImageGenerateWithPolling] 任务创建成功，任务ID: {task_id_str}")
+            
+            # 如果不自动轮询，直接返回任务ID
+            if not auto_start_polling:
+                return (
+                    json.dumps({"task_id": task_id_str, "message": "任务已创建，请手动查询结果"}, ensure_ascii=False),
+                    task_id_str,
+                    "created"
+                )
+            
+            # 步骤2: 轮询查询任务结果
+            query_url = f"{base_url.rstrip('/')}/open/api/v1/ai/getMainTask"
+            
+            # 构建查询参数
+            query_params = {
+                "appKey": api_key.strip(),
+                "appName": app_name.strip(),
+                "id": task_id,
+                "userId": user_id.strip()
+            }
+            
+            print(f"[MarketImageGenerateWithPolling] 开始轮询任务结果...")
+            print(f"[MarketImageGenerateWithPolling] 轮询间隔: {poll_interval}秒, 最大轮询时间: {max_poll_time}秒")
+            
+            start_time = time.time()
+            poll_count = 0
+            
+            while time.time() - start_time < max_poll_time:
+                poll_count += 1
+                print(f"[MarketImageGenerateWithPolling] 第 {poll_count} 次查询任务状态...")
+                
+                try:
+                    # 查询任务状态
+                    query_response = requests.post(
+                        query_url,
+                        headers=headers,
+                        json=query_params,
+                        timeout=30,
+                        verify=False
+                    )
+                    
+                    query_response.raise_for_status()
+                    query_data = query_response.json()
+                    
+                    print(f"[MarketImageGenerateWithPolling] 查询响应: {json.dumps(query_data, ensure_ascii=False)}")
+                    
+                    # 检查查询是否成功
+                    if not query_data.get("success", False):
+                        error_msg = query_data.get("message", "查询任务失败")
+                        print(f"[MarketImageGenerateWithPolling] 查询失败: {error_msg}")
+                        time.sleep(poll_interval)
+                        continue
+                    
+                    # 获取任务数据
+                    task_data = query_data.get("data")
+                    if not task_data:
+                        print("[MarketImageGenerateWithPolling] 未获取到任务数据")
+                        time.sleep(poll_interval)
+                        continue
+                    
+                    # 检查任务状态
+                    task_status = task_data.get("status", "").upper()
+                    print(f"[MarketImageGenerateWithPolling] 任务状态: {task_status}")
+                    
+                    # 任务完成状态判断
+                    if task_status in ["SUCCESS", "COMPLETED", "FINISHED"]:
+                        print(f"[MarketImageGenerateWithPolling] 任务完成！耗时 {time.time() - start_time:.1f} 秒")
+                        result_json = json.dumps(query_data, ensure_ascii=False, indent=2)
+                        return (result_json, task_id_str, "completed")
+                    
+                    elif task_status in ["FAILED", "ERROR", "CANCELLED"]:
+                        print(f"[MarketImageGenerateWithPolling] 任务失败，状态: {task_status}")
+                        error_result = {
+                            "error": f"任务失败，状态: {task_status}",
+                            "task_data": task_data
+                        }
+                        return (json.dumps(error_result, ensure_ascii=False, indent=2), task_id_str, "failed")
+                    
+                    else:
+                        # 任务仍在进行中
+                        print(f"[MarketImageGenerateWithPolling] 任务进行中，状态: {task_status}，等待 {poll_interval} 秒后重试...")
+                        time.sleep(poll_interval)
+                        continue
+                
+                except requests.exceptions.RequestException as e:
+                    print(f"[MarketImageGenerateWithPolling] 查询请求失败: {str(e)}")
+                    time.sleep(poll_interval)
+                    continue
+                
+                except Exception as e:
+                    print(f"[MarketImageGenerateWithPolling] 查询过程出错: {str(e)}")
+                    time.sleep(poll_interval)
+                    continue
+            
+            # 轮询超时
+            timeout_result = {
+                "error": f"轮询超时（{max_poll_time}秒），任务可能仍在进行中",
+                "task_id": task_id_str,
+                "poll_count": poll_count,
+                "elapsed_time": time.time() - start_time
+            }
+            
+            return (json.dumps(timeout_result, ensure_ascii=False, indent=2), task_id_str, "timeout")
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"网络请求失败: {str(e)}"
+            print(f"[MarketImageGenerateWithPolling] {error_msg}")
+            return (json.dumps({"error": error_msg}, ensure_ascii=False), "", "error")
+            
+        except json.JSONDecodeError as e:
+            error_msg = f"JSON 解析失败: {str(e)}"
+            print(f"[MarketImageGenerateWithPolling] {error_msg}")
+            return (json.dumps({"error": error_msg}, ensure_ascii=False), "", "error")
+            
+        except Exception as e:
+            error_msg = f"未知错误: {str(e)}"
+            print(f"[MarketImageGenerateWithPolling] {error_msg}")
+            return (json.dumps({"error": error_msg}, ensure_ascii=False), "", "error")
+
+
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "ImageTranslateAPI": ImageTranslateAPI,
@@ -777,7 +998,8 @@ NODE_CLASS_MAPPINGS = {
     "ADIC_COMMON_API": ADIC_COMMON_API,
     "LoadImagesFromUrls": LoadImagesFromUrls,
     "PythonCodeExecutor": PythonCodeExecutor,
-    "StringToJsonArray": StringToJsonArray
+    "StringToJsonArray": StringToJsonArray,
+    "MarketImageGenerateWithPolling": MarketImageGenerateWithPolling
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -787,5 +1009,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADIC_COMMON_API": "ADIC Common API",
     "LoadImagesFromUrls": "从URL列表加载图片",
     "PythonCodeExecutor": "Python代码执行器",
-    "StringToJsonArray": "字符串转JSON数组"
+    "StringToJsonArray": "字符串转JSON数组",
+    "MarketImageGenerateWithPolling": "营销图生图任务（带轮询）"
 } 
