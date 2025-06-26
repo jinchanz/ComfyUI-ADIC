@@ -1202,10 +1202,50 @@ class ReferenceLatent:
         return (conditioning, )
 
 
-NODE_CLASS_MAPPINGS = {
-    "ReferenceLatent": ReferenceLatent,
-}
 
+
+PREFERED_KONTEXT_RESOLUTIONS = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
+
+import comfy.utils
+
+class FluxKontextImageScale:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image": ("IMAGE", ),
+                            },
+               }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "scale"
+
+    CATEGORY = "advanced/conditioning/flux"
+    DESCRIPTION = "This node resizes the image to one that is more optimal for flux kontext."
+
+    def scale(self, image):
+        width = image.shape[2]
+        height = image.shape[1]
+        aspect_ratio = width / height
+        _, width, height = min((abs(aspect_ratio - w / h), w, h) for w, h in PREFERED_KONTEXT_RESOLUTIONS)
+        image = comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
+        return (image, )
 
 
 # 节点映射
@@ -1219,7 +1259,8 @@ NODE_CLASS_MAPPINGS = {
     "StringToJsonArray": StringToJsonArray,
     "MarketImageGenerateWithPolling": MarketImageGenerateWithPolling,
     "ImageStitch": ImageStitch,
-    "ReferenceLatent": ReferenceLatent
+    "ReferenceLatent": ReferenceLatent,
+    "FluxKontextImageScale": FluxKontextImageScale
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1232,5 +1273,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StringToJsonArray": "字符串转JSON数组",
     "MarketImageGenerateWithPolling": "营销图生图任务（带轮询）",
     "ImageStitch": "图片拼接",
-    "ReferenceLatent": "参考潜变量"
+    "ReferenceLatent": "参考潜变量",
+    "FluxKontextImageScale": "Flux Kontext 图片缩放"
 } 
