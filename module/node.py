@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 import io
 from urllib.parse import urlparse
-
+import comfy.utils
 
 
 class ADIC_COMMON_API:
@@ -1171,12 +1171,18 @@ Optional spacing can be added between images.
         concat_dim = 2 if direction in ["left", "right"] else 1
         return (torch.cat(images, dim=concat_dim),)
     
-def conditioning_set_values(conditioning, values={}):
+def conditioning_set_values(conditioning, values={}, append=False):
     c = []
     for t in conditioning:
         n = [t[0], t[1].copy()]
         for k in values:
-            n[1][k] = values[k]
+            val = values[k]
+            if append:
+                old_val = n[1].get(k, None)
+                if old_val is not None:
+                    val = old_val + val
+
+            n[1][k] = val
         c.append(n)
 
     return c
@@ -1224,7 +1230,7 @@ PREFERED_KONTEXT_RESOLUTIONS = [
     (1568, 672),
 ]
 
-import comfy.utils
+
 
 class FluxKontextImageScale:
     @classmethod
