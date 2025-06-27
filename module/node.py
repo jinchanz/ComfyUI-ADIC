@@ -1252,6 +1252,136 @@ class FluxKontextImageScale:
         _, width, height = min((abs(aspect_ratio - w / h), w, h) for w, h in PREFERED_KONTEXT_RESOLUTIONS)
         image = comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "lanczos", "center").movedim(1, -1)
         return (image, )
+    
+import torch  # Make sure you have PyTorch installed
+
+import torch
+import torch.nn.functional as F
+
+class ImageConcatFromBatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "images": ("IMAGE",),
+            "num_columns": ("INT", {"default": 3, "min": 1, "max": 255, "step": 1}),
+            "match_image_size": ("BOOLEAN", {"default": False}),
+            "max_resolution": ("INT", {"default": 4096}), 
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "concat"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+    Concatenates images from a batch into a grid with a specified number of columns.
+    """
+
+    def concat(self, images, num_columns, match_image_size, max_resolution):
+        # Assuming images is a batch of images (B, H, W, C)
+        batch_size, height, width, channels = images.shape
+        num_rows = (batch_size + num_columns - 1) // num_columns
+
+        print(f"Initial dimensions: batch_size={batch_size}, height={height}, width={width}, channels={channels}")
+        print(f"num_rows={num_rows}, num_columns={num_columns}")
+
+        if match_image_size:
+            target_shape = images[0].shape
+
+            resized_images = []
+            for image in images:
+                original_height = image.shape[0]
+                original_width = image.shape[1]
+                original_aspect_ratio = original_width / original_height
+
+                if original_aspect_ratio > 1:
+                    target_height = target_shape[0]
+                    target_width = int(target_height * original_aspect_ratio)
+                else:
+                    target_width = target_shape[1]
+                    target_height = int(target_width / original_aspect_ratio)
+
+                print(f"Resizing image from ({original_height}, {original_width}) to ({target_height}, {target_width})")
+
+                # 修复：正确处理维度转换
+                # 从 (H, W, C) 转换为 (1, C, H, W)
+                image_for_resize = image.permute(2, 0, 1).unsqueeze(0)
+                
+                # 使用 interpolate 调整大小
+                resized_image = F.interpolate(
+                    image_for_resize, 
+                    size=(target_height, target_width), 
+                    mode="bilinear", 
+                    align_corners=False
+                )
+                
+                # 转换回 (H, W, C) 格式
+                resized_image = resized_image.squeeze(0).permute(1, 2, 0)
+                resized_images.append(resized_image)
+
+            # Convert the list of resized images back to a tensor
+            images = torch.stack(resized_images)
+            height, width = target_shape[:2]
+
+        # 计算网格尺寸和缩放
+        grid_height = num_rows * height
+        grid_width = num_columns * width
+
+        print(f"Grid dimensions before scaling: grid_height={grid_height}, grid_width={grid_width}")
+
+        # 计算缩放因子
+        scale_factor = min(max_resolution / grid_height, max_resolution / grid_width, 1.0)
+
+        # 应用缩放并调整到8的倍数
+        scaled_height = height * scale_factor
+        scaled_width = width * scale_factor
+
+        height = max(8, int(round(scaled_height / 8) * 8))
+        width = max(8, int(round(scaled_width / 8) * 8))
+
+        # 重新计算网格尺寸
+        grid_height = num_rows * height
+        grid_width = num_columns * width
+        
+        print(f"Grid dimensions after scaling: grid_height={grid_height}, grid_width={grid_width}")
+        print(f"Final image dimensions: height={height}, width={width}")
+
+        # 创建空网格
+        grid = torch.zeros((grid_height, grid_width, channels), dtype=images.dtype, device=images.device)
+
+        # 填充网格
+        for idx, image in enumerate(images):
+            if idx >= batch_size:  # 防止索引越界
+                break
+                
+            # 修复：正确处理图像缩放
+            # 从 (H, W, C) 转换为 (1, C, H, W)
+            image_for_resize = image.permute(2, 0, 1).unsqueeze(0)
+            
+            # 调整大小
+            resized_image = F.interpolate(
+                image_for_resize, 
+                size=(height, width), 
+                mode="bilinear", 
+                align_corners=False
+            )
+            
+            # 转换回 (H, W, C) 并移除批次维度
+            resized_image = resized_image.squeeze(0).permute(1, 2, 0)
+            
+            # 计算在网格中的位置
+            row = idx // num_columns
+            col = idx % num_columns
+            
+            # 确保不会越界
+            start_row = row * height
+            end_row = min(start_row + height, grid_height)
+            start_col = col * width
+            end_col = min(start_col + width, grid_width)
+            
+            # 放置图像到网格中
+            grid[start_row:end_row, start_col:end_col, :] = resized_image[:end_row-start_row, :end_col-start_col, :]
+
+        return (grid.unsqueeze(0),)  # 注意返回元组
 
 
 # 节点映射
@@ -1266,7 +1396,8 @@ NODE_CLASS_MAPPINGS = {
     "MarketImageGenerateWithPolling": MarketImageGenerateWithPolling,
     "ImageStitch": ImageStitch,
     "ReferenceLatent": ReferenceLatent,
-    "FluxKontextImageScale": FluxKontextImageScale
+    "FluxKontextImageScale": FluxKontextImageScale,
+    "MaletteImageConcatFromBatch": ImageConcatFromBatch
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1280,5 +1411,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MarketImageGenerateWithPolling": "营销图生图任务（带轮询）",
     "ImageStitch": "图片拼接",
     "ReferenceLatent": "参考潜变量",
-    "FluxKontextImageScale": "Flux Kontext 图片缩放"
+    "FluxKontextImageScale": "Flux Kontext 图片缩放",
+    "MaletteImageConcatFromBatch": "图片拼接"
 } 
