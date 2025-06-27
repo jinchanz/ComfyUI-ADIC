@@ -1394,9 +1394,9 @@ NODE_CLASS_MAPPINGS = {
     "PythonCodeExecutor": PythonCodeExecutor,
     "StringToJsonArray": StringToJsonArray,
     "MarketImageGenerateWithPolling": MarketImageGenerateWithPolling,
-    "ImageStitch": ImageStitch,
-    "ReferenceLatent": ReferenceLatent,
-    "FluxKontextImageScale": FluxKontextImageScale,
+    "MaletteImageStitch": ImageStitch,
+    "MaletteReferenceLatent": ReferenceLatent,
+    "MaletteFluxKontextImageScale": FluxKontextImageScale,
     "MaletteImageConcatFromBatch": ImageConcatFromBatch
 }
 
@@ -1409,8 +1409,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PythonCodeExecutor": "Python代码执行器",
     "StringToJsonArray": "字符串转JSON数组",
     "MarketImageGenerateWithPolling": "营销图生图任务（带轮询）",
-    "ImageStitch": "图片拼接",
-    "ReferenceLatent": "参考潜变量",
-    "FluxKontextImageScale": "Flux Kontext 图片缩放",
+    "MaletteImageStitch": "图片拼接",
+    "MaletteReferenceLatent": "参考潜变量",
+    "MaletteFluxKontextImageScale": "Flux Kontext 图片缩放",
     "MaletteImageConcatFromBatch": "图片拼接"
 } 
