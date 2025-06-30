@@ -1,4 +1,5 @@
 import json
+import traceback
 import requests
 from typing import List, Dict, Any
 import torch
@@ -589,13 +590,17 @@ output = "请在上方编写代码"
         import math
         import random
         from datetime import datetime, timedelta
+
+        _input1 = input1 if type(input1) == str else json.dumps(input1)
+        _input2 = input2 if type(input2) == str else json.dumps(input2)
+        _input3 = input3 if type(input3) == str else json.dumps(input3)
         
         try:
             # 准备执行环境
             local_vars = {
-                'input1': input1,
-                'input2': input2, 
-                'input3': input3,
+                'input1': _input1,
+                'input2': _input2, 
+                'input3': _input3,
                 'json': json,
                 're': re,
                 'math': math,
@@ -649,9 +654,18 @@ output = "请在上方编写代码"
             logs = []
             logs.append(f"[PythonCodeExecutor] 开始执行代码，安全模式: {'开启' if safe_mode else '关闭'}")
             logs.append(f"[PythonCodeExecutor] 输入数据:")
-            logs.append(f"  input1: {repr(input1[:100])}{'...' if len(input1) > 100 else ''}")
-            logs.append(f"  input2: {repr(input2[:100])}{'...' if len(input2) > 100 else ''}")
-            logs.append(f"  input3: {repr(input3[:100])}{'...' if len(input3) > 100 else ''}")
+            try:
+                logs.append(f"  input1: {repr(_input1[:100])}{'...' if len(_input1) > 100 else ''}")
+            except Exception as e:
+                print(f"[PythonCodeExecutor] 输入1解析失败: {str(e)}, input1: {_input1}")
+            try:
+                logs.append(f"  input2: {repr(_input2[:100])}{'...' if len(_input2) > 100 else ''}")
+            except Exception as e:
+                print(f"[PythonCodeExecutor] 输入2解析失败: {str(e)}, input2: {_input2}")
+            try:
+                logs.append(f"  input3: {repr(_input3[:100])}{'...' if len(_input3) > 100 else ''}")
+            except Exception as e:
+                print(f"[PythonCodeExecutor] 输入3解析失败: {str(e)}, input3: {_input3}")
             
             # 执行用户代码
             exec(code, {"__builtins__": {}}, local_vars)
@@ -696,7 +710,8 @@ output = "请在上方编写代码"
             return (json.dumps({"error": error_msg}, ensure_ascii=False), log_output)
             
         except Exception as e:
-            error_msg = f"执行错误: {str(e)}"
+            error_msg = f"执行错误: {str(e)}, {traceback.format_exc()}"
+            print(f"[PythonCodeExecutor] {error_msg}, {traceback.format_exc()}")
             log_output = f"[PythonCodeExecutor] {error_msg}"
             return (json.dumps({"error": error_msg}, ensure_ascii=False), log_output)
         
