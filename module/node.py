@@ -1509,7 +1509,7 @@ class AliCloudOSSUpload:
                     })
             
             # 处理文件路径批次上传
-            elif file_paths and file_paths.strip():
+            if file_paths and file_paths.strip():
                 # 解析文件路径（支持换行分隔）
                 paths = [path.strip() for path in file_paths.strip().split('\n') if path.strip()]
                 
@@ -1528,9 +1528,6 @@ class AliCloudOSSUpload:
                     if not batch_upload and i == 0:
                         # 如果不是批量上传，只处理第一个文件
                         break
-            
-            else:
-                raise ValueError("必须提供image或file_paths中的一个")
             
             if not upload_tasks:
                 raise ValueError("没有找到有效的上传文件")
@@ -1660,7 +1657,8 @@ class AliCloudOSSUpload:
                         "content_type": actual_content_type,
                         "size": len(upload_data),
                         "oss_url": oss_url,
-                        "public_url": public_url
+                        "public_url": public_url,
+                        "type": task['type']
                     }
                     upload_results.append(upload_result)
                     
@@ -1674,7 +1672,8 @@ class AliCloudOSSUpload:
                     upload_result = {
                         "success": False,
                         "index": task['index'],
-                        "error": error_msg
+                        "error": error_msg,
+                        "type": task['type']
                     }
                     upload_results.append(upload_result)
                     
