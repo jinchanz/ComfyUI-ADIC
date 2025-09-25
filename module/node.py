@@ -7,9 +7,28 @@ import numpy as np
 from PIL import Image
 import io
 import os
-import base64
 from urllib.parse import urlparse
 import comfy.utils
+from comfy.comfy_types.node_typing import IO, ComfyNodeABC, InputTypeDict
+
+
+from comfy_api_nodes.apis import (
+    OpenAIImageGenerationRequest,
+    OpenAIImageEditRequest,
+    OpenAIImageGenerationResponse,
+)
+
+from comfy_api_nodes.apis.client import (
+    ApiEndpoint,
+    HttpMethod,
+    SynchronousOperation,
+)
+
+from comfy_api_nodes.apinode_utils import (
+    downscale_image_tensor,
+    validate_and_cast_response,
+    validate_string,
+)
 
 try:
     import oss2
@@ -36,13 +55,13 @@ class ADIC_COMMON_API:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("response",)
 
-    FUNCTION = "translate"
+    FUNCTION = "request"
 
     OUTPUT_NODE = True
 
     CATEGORY = "Malette"
 
-    def translate(self, params, app_name, api_key, api_endpoint):
+    def request(self, params, app_name, api_key, api_endpoint):
         try:
             # 验证必填参数
             if not api_key or api_key.strip() == "":
@@ -1737,6 +1756,192 @@ class AliCloudOSSUpload:
         url = bucket.sign_url('GET', file_id, expires, params={})
         print('[AliCloudOSSUpload] oss file url is %s' % url)
         return url
+    
+
+class ADICOpenAIGPTImage1(ComfyNodeABC):
+    """
+    Generates images synchronously via OpenAI's GPT Image 1 endpoint.
+    """
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True,}),
+            },
+            "optional": {
+                "api_base": ("STRING", {"default": ""}),
+                "auth_token": ("STRING", {"default": ""}),
+                "seed": (
+                    IO.INT,
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 2**31 - 1,
+                        "step": 1,
+                        "display": "number",
+                        "control_after_generate": True,
+                        "tooltip": "not implemented yet in backend",
+                    },
+                ),
+                "quality": (
+                    IO.COMBO,
+                    {
+                        "options": ["low", "medium", "high"],
+                        "default": "low",
+                        "tooltip": "Image quality, affects cost and generation time.",
+                    },
+                ),
+                "background": (
+                    IO.COMBO,
+                    {
+                        "options": ["opaque", "transparent"],
+                        "default": "opaque",
+                        "tooltip": "Return image with or without background",
+                    },
+                ),
+                "size": (
+                    IO.COMBO,
+                    {
+                        "options": ["auto", "1024x1024", "1024x1536", "1536x1024"],
+                        "default": "auto",
+                        "tooltip": "Image size",
+                    },
+                ),
+                "n": (
+                    IO.INT,
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 8,
+                        "step": 1,
+                        "display": "number",
+                        "tooltip": "How many images to generate",
+                    },
+                ),
+                "image": (
+                    IO.IMAGE,
+                    {
+                        "default": None,
+                        "tooltip": "Optional reference image for image editing.",
+                    },
+                ),
+                "mask": (
+                    IO.MASK,
+                    {
+                        "default": None,
+                        "tooltip": "Optional mask for inpainting (white areas will be replaced)",
+                    },
+                ),
+            },
+            "hidden": {
+                "comfy_api_key": "API_KEY_COMFY_ORG",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = (IO.IMAGE,)
+    FUNCTION = "api_call"
+    CATEGORY = "api node/image/OpenAI"
+    API_NODE = True
+
+    async def api_call(
+        self,
+        prompt,
+        seed=0,
+        quality="low",
+        background="opaque",
+        image=None,
+        mask=None,
+        n=1,
+        size="1024x1024",
+        unique_id=None,
+        **kwargs,
+    ):
+        validate_string(prompt, strip_whitespace=False)
+        model = "gpt-image-1"
+        path = "/v1/images/generations"
+        content_type = "application/json"
+        request_class = OpenAIImageGenerationRequest
+        files = []
+
+        if image is not None:
+            path = "/v1/images/edits"
+            request_class = OpenAIImageEditRequest
+            content_type = "multipart/form-data"
+
+            batch_size = image.shape[0]
+
+            for i in range(batch_size):
+                single_image = image[i : i + 1]
+                scaled_image = downscale_image_tensor(single_image).squeeze()
+
+                image_np = (scaled_image.numpy() * 255).astype(np.uint8)
+                img = Image.fromarray(image_np)
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format="PNG")
+                img_byte_arr.seek(0)
+
+                if batch_size == 1:
+                    files.append(("image", (f"image_{i}.png", img_byte_arr, "image/png")))
+                else:
+                    files.append(("image[]", (f"image_{i}.png", img_byte_arr, "image/png")))
+
+        if mask is not None:
+            if image is None:
+                raise Exception("Cannot use a mask without an input image")
+            if image.shape[0] != 1:
+                raise Exception("Cannot use a mask with multiple image")
+            if mask.shape[1:] != image.shape[1:-1]:
+                raise Exception("Mask and Image must be the same size")
+            batch, height, width = mask.shape
+            rgba_mask = torch.zeros(height, width, 4, device="cpu")
+            rgba_mask[:, :, 3] = 1 - mask.squeeze().cpu()
+
+            scaled_mask = downscale_image_tensor(rgba_mask.unsqueeze(0)).squeeze()
+
+            mask_np = (scaled_mask.numpy() * 255).astype(np.uint8)
+            mask_img = Image.fromarray(mask_np)
+            mask_img_byte_arr = io.BytesIO()
+            mask_img.save(mask_img_byte_arr, format="PNG")
+            mask_img_byte_arr.seek(0)
+            files.append(("mask", ("mask.png", mask_img_byte_arr, "image/png")))
+
+        api_base = ''
+        if kwargs is not None:
+            api_base = kwargs.get("api_base")
+        # Build the operation
+        operation = SynchronousOperation(
+            api_base= api_base or "https://api.gpt.ge",
+            endpoint=ApiEndpoint(
+                path=path,
+                method=HttpMethod.POST,
+                request_model=request_class,
+                response_model=OpenAIImageGenerationResponse,
+            ),
+            request=request_class(
+                model=model,
+                prompt=prompt,
+                quality=quality,
+                background=background,
+                n=n,
+                seed=seed,
+                size=size,
+            ),
+            files=files if files else None,
+            content_type=content_type,
+            auth_kwargs=kwargs,
+        )
+
+        response = await operation.execute()
+
+        img_tensor = await validate_and_cast_response(response, node_id=unique_id)
+        return (img_tensor,)
+
+
 
 # 节点映射
 NODE_CLASS_MAPPINGS = {
@@ -1752,7 +1957,8 @@ NODE_CLASS_MAPPINGS = {
     "MaletteReferenceLatent": ReferenceLatent,
     "MaletteFluxKontextImageScale": FluxKontextImageScale,
     "MaletteImageConcatFromBatch": ImageConcatFromBatch,
-    "AliCloudOSSUpload": AliCloudOSSUpload
+    "AliCloudOSSUpload": AliCloudOSSUpload,
+    "ADICOpenAIGPTImage1": ADICOpenAIGPTImage1,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1768,5 +1974,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaletteReferenceLatent": "参考潜变量",
     "MaletteFluxKontextImageScale": "Flux Kontext 图片缩放",
     "MaletteImageConcatFromBatch": "图片拼接",
-    "AliCloudOSSUpload": "阿里云OSS文件上传"
+    "AliCloudOSSUpload": "阿里云OSS文件上传",
+    "OpenAIGPTImage1": "ADIC OpenAIGPTImage1"
 } 
