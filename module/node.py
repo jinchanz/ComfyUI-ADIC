@@ -2049,7 +2049,7 @@ class IdeaLabImageGenerate(ComfyNodeABC):
             data_uri = tensor_to_data_uri(image[0], mime_type=image_mime_type)
             content_blocks.append(
                 {
-                    "type": "input_image",
+                    "type": "image_url",
                     "image_url": {"url": data_uri},
                 }
             )
