@@ -1,7 +1,8 @@
 import json
 import traceback
 import requests
-from typing import List, Dict, Any
+import base64
+from typing import List, Dict, Any, Optional
 import torch
 import numpy as np
 from PIL import Image
@@ -10,6 +11,7 @@ import os
 from urllib.parse import urlparse
 import comfy.utils
 from comfy.comfy_types.node_typing import IO, ComfyNodeABC, InputTypeDict
+from pydantic import BaseModel, Field, ConfigDict
 
 
 from comfy_api_nodes.apis import (
@@ -28,6 +30,9 @@ from comfy_api_nodes.apinode_utils import (
     downscale_image_tensor,
     validate_and_cast_response,
     validate_string,
+    download_url_to_bytesio,
+    tensor_to_data_uri,
+    bytesio_to_image_tensor,
 )
 
 try:
@@ -1943,6 +1948,185 @@ class ADICOpenAIGPTImage1(ComfyNodeABC):
 
 
 
+class GeminiChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[Dict[str, Any]]
+    stream: bool = False
+
+
+class GeminiChatCompletionChoice(BaseModel):
+    message: Dict[str, Any]
+
+
+class GeminiChatCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    success: Optional[bool] = None
+    message: Optional[str] = None
+    request_id: Optional[str] = Field(default=None, alias="requestId")
+    choices: Optional[List[GeminiChatCompletionChoice]] = None
+
+
+class IdeaLabImageGenerate(ComfyNodeABC):
+    """
+    Generates images synchronously via IdeaLab Image Generate endpoint.
+
+    """
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True,}),
+            },
+            "optional": {
+                "image": (
+                    IO.IMAGE,
+                    {
+                        "default": None,
+                        "tooltip": "可选参考图，仅支持批量中的第一张",
+                    },
+                ),
+                "image_mime_type": (
+                    IO.COMBO,
+                    {
+                        "options": ["image/png", "image/jpeg", "image/webp"],
+                        "default": "image/png",
+                        "tooltip": "上传到 Gemini 的图片编码格式",
+                    },
+                ),
+                "model": (
+                    "STRING",
+                    {
+                        "default": "gemini-3-pro-image-preview",
+                        "tooltip": "可切换的 Gemini 模型名称",
+                    },
+                ),
+                "api_base": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "API 基础地址，例如 https://host/api/openai",
+                    },
+                ),
+                "auth_token": ("STRING", {"default": "", "tooltip": "Bearer Token"}),
+            },
+            "hidden": {
+                "comfy_api_key": "API_KEY_COMFY_ORG",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = (IO.IMAGE,)
+    FUNCTION = "api_call"
+    CATEGORY = "api node/image/Gemini"
+    API_NODE = True
+
+    async def api_call(
+        self,
+        prompt,
+        image=None,
+        image_mime_type="image/png",
+        model="gemini-3-pro-image-preview",
+        api_base="",
+        auth_token="",
+        unique_id=None,
+        **kwargs,
+    ):
+        content_blocks: List[Dict[str, Any]] = []
+        if prompt and prompt.strip():
+            validate_string(prompt, strip_whitespace=False)
+            content_blocks.append({"type": "text", "text": prompt})
+
+        if image is not None:
+            if len(image.shape) < 4 or image.shape[0] == 0:
+                raise ValueError("输入图片格式不正确")
+            if image.shape[0] > 1:
+                raise ValueError("暂不支持批量图片，请只输入一张")
+            data_uri = tensor_to_data_uri(image[0], mime_type=image_mime_type)
+            content_blocks.append(
+                {
+                    "type": "input_image",
+                    "image_url": {"url": data_uri},
+                }
+            )
+
+        if not content_blocks:
+            raise ValueError("请至少提供文本或图片中的一种输入")
+
+        path = "/v1/chat/completions"
+        request = GeminiChatCompletionRequest(
+            model=model or "gemini-3-pro-image-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": content_blocks,
+                }
+            ],
+            stream=False,
+        )
+        auth_kwargs = dict(kwargs) if kwargs else {}
+        if auth_token:
+            auth_kwargs["auth_token"] = auth_token
+
+        operation = SynchronousOperation(
+            api_base=api_base,
+            endpoint=ApiEndpoint(
+                path=path,
+                method=HttpMethod.POST,
+                request_model=GeminiChatCompletionRequest,
+                response_model=GeminiChatCompletionResponse,
+            ),
+            request=request,
+            auth_kwargs=auth_kwargs,
+        )
+        response = await operation.execute()
+
+        if response.success is False:
+            raise ValueError(response.message or "Gemini 接口返回失败")
+
+        if not response.choices:
+            raise ValueError("Gemini 接口未返回可用的结果")
+
+        message = response.choices[0].message or {}
+        content = message.get("content")
+        image_url = None
+
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image_url":
+                    image_url = item.get("image_url", {}).get("url")
+                    if image_url:
+                        break
+        elif isinstance(content, dict):
+            if content.get("type") == "image_url":
+                image_url = content.get("image_url", {}).get("url")
+        elif isinstance(content, str):
+            image_url = content
+
+        if not image_url:
+            raise ValueError("Gemini 接口未返回图片内容")
+
+        if image_url.startswith("http://") or image_url.startswith("https://"):
+            img_bytesio = await download_url_to_bytesio(image_url)
+        else:
+            if image_url.startswith("data:"):
+                _, _, encoded = image_url.partition(",")
+            else:
+                encoded = image_url
+            try:
+                img_bytes = base64.b64decode(encoded)
+            except Exception as exc:
+                raise ValueError("返回的图片内容不是有效的 Base64 数据") from exc
+            img_bytesio = io.BytesIO(img_bytes)
+
+        img_tensor = bytesio_to_image_tensor(img_bytesio)
+        return (img_tensor,)
 # 节点映射
 NODE_CLASS_MAPPINGS = {
     "ImageTranslateAPI": ImageTranslateAPI,
@@ -1959,6 +2143,7 @@ NODE_CLASS_MAPPINGS = {
     "MaletteImageConcatFromBatch": ImageConcatFromBatch,
     "AliCloudOSSUpload": AliCloudOSSUpload,
     "ADICOpenAIGPTImage1": ADICOpenAIGPTImage1,
+    "IdeaLabImageGenerate": IdeaLabImageGenerate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1975,5 +2160,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MaletteFluxKontextImageScale": "Flux Kontext 图片缩放",
     "MaletteImageConcatFromBatch": "图片拼接",
     "AliCloudOSSUpload": "阿里云OSS文件上传",
-    "OpenAIGPTImage1": "ADIC OpenAIGPTImage1"
+    "OpenAIGPTImage1": "ADIC OpenAIGPTImage1",
+    "IdeaLabImageGenerate": "IdeaLab Image Generate",
 } 
