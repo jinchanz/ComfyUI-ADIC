@@ -2007,9 +2007,8 @@ class IdeaLabImageGenerate(ComfyNodeABC):
                     },
                 ),
                 "image_mime_type": (
-                    IO.COMBO,
+                    "STRING",
                     {
-                        "options": ["image/png", "image/jpeg", "image/webp"],
                         "default": "image/png",
                         "tooltip": "上传到 Gemini 的图片编码格式",
                     },
