@@ -1051,6 +1051,14 @@ class ImageStitch:
                     "INT",
                     {"default": 0, "min": 0, "max": 1024, "step": 2},
                 ),
+                "image_urls": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "可选图片 URL，每行一个，0 个或多个",
+                    },
+                ),
                 "spacing_color": (
                     ["white", "black", "red", "green", "blue"],
                     {"default": "white"},
@@ -1987,7 +1995,15 @@ class IdeaLabImageGenerate(ComfyNodeABC):
                     IO.IMAGE,
                     {
                         "default": None,
-                        "tooltip": "可选参考图，仅支持批量中的第一张",
+                        "tooltip": "可选参考图，支持多张图片批量输入",
+                    },
+                ),
+                "image_urls": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "可选图片 URL，每行一个，0 个或多个",
                     },
                 ),
                 "image_mime_type": (
@@ -2029,6 +2045,7 @@ class IdeaLabImageGenerate(ComfyNodeABC):
         self,
         prompt,
         image=None,
+        image_urls="",
         image_mime_type="image/png",
         model="gemini-3-pro-image-preview",
         api_base="",
@@ -2044,15 +2061,28 @@ class IdeaLabImageGenerate(ComfyNodeABC):
         if image is not None:
             if len(image.shape) < 4 or image.shape[0] == 0:
                 raise ValueError("输入图片格式不正确")
-            if image.shape[0] > 1:
-                raise ValueError("暂不支持批量图片，请只输入一张")
-            data_uri = tensor_to_data_uri(image[0], mime_type=image_mime_type)
-            content_blocks.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_uri},
-                }
-            )
+            for idx in range(image.shape[0]):
+                data_uri = tensor_to_data_uri(image[idx], mime_type=image_mime_type)
+                content_blocks.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    }
+                )
+
+        if image_urls:
+            urls = [
+                line.strip()
+                for line in image_urls.splitlines()
+                if line.strip()
+            ]
+            for url in urls:
+                content_blocks.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                    }
+                )
 
         if not content_blocks:
             raise ValueError("请至少提供文本或图片中的一种输入")
