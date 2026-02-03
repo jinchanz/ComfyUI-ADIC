@@ -580,7 +580,19 @@ class LoadImagesFromUrls:
 
 
 class PythonCodeExecutor:
-    """Python代码执行器节点"""
+    """Python代码执行器节点
+    
+    ⚠️ 安全说明：
+    此节点提供的是受限的Python执行环境，用于数据处理任务。
+    安全保护已强制启用，无法关闭。禁止使用的操作包括：
+    - 导入模块（os, sys, subprocess, shutil 等）
+    - 访问对象内部属性（__class__, __base__, __subclasses__ 等）
+    - 使用反射函数（eval, exec, compile, __import__ 等）
+    - 文件操作和系统调用
+    - 序列化/反序列化（pickle, marshal 等）
+    
+    只允许使用提供的白名单函数进行数据转换。
+    """
     
     @classmethod
     def INPUT_TYPES(s):
@@ -589,7 +601,10 @@ class PythonCodeExecutor:
                 "code": ("STRING", {"multiline": True, "default": """# 在这里编写Python代码
 # 可用变量：
 # - input1, input2, input3: 输入数据
-# - json, re: 预导入的模块
+# - json, re, math, random, datetime, timedelta: 预导入的模块
+# 
+# 可用函数：len, str, int, float, list, dict, tuple, set, range
+#          enumerate, zip, map, filter, sorted, max, min, sum, any, all
 # 
 # 示例：将换行分割的字符串转换为JSON数组
 # lines = input1.strip().split('\\n')
@@ -604,7 +619,7 @@ output = "请在上方编写代码"
                 "input1": ("STRING", {"default": "", "forceInput": True}),
                 "input2": ("STRING", {"default": "", "forceInput": True}),
                 "input3": ("STRING", {"default": "", "forceInput": True}),
-                "safe_mode": ("BOOLEAN", {"default": True}),
+                "safe_mode": ("BOOLEAN", {"default": True, "tooltip": "已强制启用安全模式（防止沙箱逃逸），此参数已废弃"}),
             }
         }
 
@@ -629,6 +644,28 @@ output = "请在上方编写代码"
         _input3 = input3 if type(input3) == str else json.dumps(input3)
         
         try:
+            # 强制启用安全模式检查（即使参数设为 False，也要进行基础安全检查）
+            # 这是为了防止沙箱逃逸攻击
+            dangerous_keywords = [
+                'import os', 'import sys', 'import subprocess', 'import shutil',
+                '__import__', 'eval', 'exec', 'compile', 'open', 'file',
+                'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
+                'getattr', 'setattr', 'delattr', 'hasattr',
+                # 防止通过特殊属性进行沙箱逃逸
+                '__class__', '__base__', '__subclasses__', '__mro__',
+                '__dict__', '__getattribute__', '__setattr__',
+                '__globals__', '__code__', '__builtins__',
+                '__new__', '__init__', '__loader__', '__spec__',
+                'object.__', 'type.__', '__func__', '__self__',
+                '__closure__', '__module__', '__qualname__'
+            ]
+            
+            code_lower = code.lower()
+            for keyword in dangerous_keywords:
+                if keyword.lower() in code_lower:
+                    return (json.dumps({"error": f"代码包含被禁用的内容: {keyword}"}, ensure_ascii=False), 
+                           f"[PythonCodeExecutor] 安全检查失败: 发现禁用关键词 '{keyword}'")
+            
             # 准备执行环境
             local_vars = {
                 'input1': _input1,
@@ -663,18 +700,16 @@ output = "请在上方编写代码"
                 'output': None
             }
             
-            # 安全模式检查
+            # safe_mode 参数仅用于日志记录，实际安全检查始终启用
             if safe_mode:
-                dangerous_keywords = [
-                    'import os', 'import sys', 'import subprocess', 'import shutil',
-                    '__import__', 'eval', 'exec', 'compile', 'open', 'file',
-                    'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
-                    'getattr', 'setattr', 'delattr', 'hasattr'
+                additional_dangerous_keywords = [
+                    'pickle', 'marshal', 'shelve', 'dill',
+                    '__reduce__', '__getstate__', '__setstate__',
+                    '__getnewargs__', '__getinitargs__'
                 ]
                 
-                code_lower = code.lower()
-                for keyword in dangerous_keywords:
-                    if keyword in code_lower:
+                for keyword in additional_dangerous_keywords:
+                    if keyword.lower() in code_lower:
                         return (json.dumps({"error": f"安全模式禁止使用: {keyword}"}, ensure_ascii=False), 
                                f"[PythonCodeExecutor] 安全检查失败: 发现禁用关键词 '{keyword}'")
             
@@ -685,7 +720,7 @@ output = "请在上方编写代码"
             sys.stdout = captured_output = io.StringIO()
             
             logs = []
-            logs.append(f"[PythonCodeExecutor] 开始执行代码，安全模式: {'开启' if safe_mode else '关闭'}")
+            logs.append(f"[PythonCodeExecutor] 开始执行代码，安全模式已强制启用（防止沙箱逃逸）")
             logs.append(f"[PythonCodeExecutor] 输入数据:")
             try:
                 logs.append(f"  input1: {repr(_input1[:100])}{'...' if len(_input1) > 100 else ''}")
@@ -700,8 +735,15 @@ output = "请在上方编写代码"
             except Exception as e:
                 print(f"[PythonCodeExecutor] 输入3解析失败: {str(e)}, input3: {_input3}")
             
-            # 执行用户代码
-            exec(code, {"__builtins__": {}}, local_vars)
+            # 创建受限的运行环境，禁止访问危险属性
+            # 使用 RestrictedPython 式的方法限制对象属性访问
+            restricted_builtins = {
+                '__name__': '__main__',
+                '__doc__': None,
+            }
+            
+            # 执行用户代码，完全禁用内置函数，仅提供白名单中的函数
+            exec(code, {"__builtins__": restricted_builtins}, local_vars)
             
             # 恢复stdout
             sys.stdout = old_stdout
