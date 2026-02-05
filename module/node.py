@@ -646,25 +646,20 @@ output = "请在上方编写代码"
         try:
             # 强制启用安全模式检查（即使参数设为 False，也要进行基础安全检查）
             # 这是为了防止沙箱逃逸攻击
-            dangerous_keywords = [
-                'import os', 'import sys', 'import subprocess', 'import shutil',
-                '__import__', 'eval', 'exec', 'compile', 'open', 'file',
-                'input', 'raw_input', 'globals', 'locals', 'vars', 'dir',
-                'getattr', 'setattr', 'delattr', 'hasattr',
-                # 防止通过特殊属性进行沙箱逃逸
-                '__class__', '__base__', '__subclasses__', '__mro__',
-                '__dict__', '__getattribute__', '__setattr__',
-                '__globals__', '__code__', '__builtins__',
-                '__new__', '__init__', '__loader__', '__spec__',
-                'object.__', 'type.__', '__func__', '__self__',
-                '__closure__', '__module__', '__qualname__'
+            # 使用正则表达式进行完整词匹配，避免子字符串误匹配
+            dangerous_patterns = [
+                r'\bimport\s+(os|sys|subprocess|shutil|pickle|marshal|shelve|dill)\b',
+                r'\b(__import__|eval|exec|compile|open|file|__class__|__base__|__subclasses__|__mro__|__dict__|__getattribute__|__setattr__|__globals__|__code__|__builtins__|__new__|__init__|__loader__|__spec__|__func__|__self__|__closure__|__module__|__qualname__|__reduce__|__getstate__|__setstate__|__getnewargs__|__getinitargs__)\b',
+                r'\b(raw_input|globals|locals|vars|dir|getattr|setattr|delattr|hasattr)\s*\(',
+                r'\bobject\.__',
+                r'\btype\.__',
             ]
             
             code_lower = code.lower()
-            for keyword in dangerous_keywords:
-                if keyword.lower() in code_lower:
-                    return (json.dumps({"error": f"代码包含被禁用的内容: {keyword}"}, ensure_ascii=False), 
-                           f"[PythonCodeExecutor] 安全检查失败: 发现禁用关键词 '{keyword}'")
+            for pattern in dangerous_patterns:
+                if re.search(pattern, code_lower):
+                    return (json.dumps({"error": f"代码包含被禁用的内容（匹配模式: {pattern}）"}, ensure_ascii=False), 
+                           f"[PythonCodeExecutor] 安全检查失败: 发现被禁用的操作")
             
             # 准备执行环境
             local_vars = {
@@ -702,16 +697,17 @@ output = "请在上方编写代码"
             
             # safe_mode 参数仅用于日志记录，实际安全检查始终启用
             if safe_mode:
-                additional_dangerous_keywords = [
-                    'pickle', 'marshal', 'shelve', 'dill',
-                    '__reduce__', '__getstate__', '__setstate__',
-                    '__getnewargs__', '__getinitargs__'
+                additional_dangerous_patterns = [
+                    r'\bpickle\b',
+                    r'\bmarshal\b',
+                    r'\bshelve\b',
+                    r'\bdill\b',
                 ]
                 
-                for keyword in additional_dangerous_keywords:
-                    if keyword.lower() in code_lower:
-                        return (json.dumps({"error": f"安全模式禁止使用: {keyword}"}, ensure_ascii=False), 
-                               f"[PythonCodeExecutor] 安全检查失败: 发现禁用关键词 '{keyword}'")
+                for pattern in additional_dangerous_patterns:
+                    if re.search(pattern, code_lower):
+                        return (json.dumps({"error": f"安全模式禁止使用: {pattern}"}, ensure_ascii=False), 
+                               f"[PythonCodeExecutor] 安全检查失败: 发现禁用关键词 '{pattern}'")
             
             # 捕获print输出
             import io
