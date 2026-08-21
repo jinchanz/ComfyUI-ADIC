@@ -133,8 +133,8 @@ class RemoteTemplateBatchCompose:
         layer = template_data.get("layer")
         if not isinstance(layer, dict):
             raise ValueError("模板缺少 layer 对象")
-        if layer.get("type") != "template":
-            raise ValueError(f"layer.type 必须为 template，当前为: {layer.get('type')}")
+        if layer.get("type") not in ("template", "frame"):
+            raise ValueError(f"layer.type 必须为 template 或 frame，当前为: {layer.get('type')}")
 
         rules = template_data.get("templateRules")
         if not isinstance(rules, dict):
@@ -159,10 +159,7 @@ class RemoteTemplateBatchCompose:
                 raise ValueError(
                     f"规则 '{field_name}' 类型不一致: 规则为 '{rule_type}'，节点为 '{node.get('type')}'"
                 )
-            if node.get("columnName") != field_name:
-                raise ValueError(
-                    f"规则键 '{field_name}' 与节点 columnName '{node.get('columnName')}' 不一致"
-                )
+            # 规则键与节点 columnName 的一致性不在本地校验，由远端接口负责
 
     def _compose_one(self, template_data, item, config):
         """处理单条数据，返回成功结果"""
@@ -196,9 +193,9 @@ class RemoteTemplateBatchCompose:
             else:
                 raise ValueError(f"规则 '{field_name}' 类型 '{rule.get('type')}' 不支持替换")
 
-        # 生成可编辑画布 JSON：最外层 type 为 page，模板放入 layers；
-        # 规则按 templateRules[模板名称][字段名] 输出；
-        # colorPalette 与模板中不认识的顶层字段原样保留
+        # 本地拼装的画布仅作兜底：最外层 type 为 page，模板放入 layers；
+        # 远端返回结果 templateJson 时以远端为准。
+        # colorPalette / colorPalettes 是可选字段，原样透传，缺失时不补默认值
         canvas = {
             key: copy.deepcopy(value)
             for key, value in template_data.items()
@@ -207,9 +204,9 @@ class RemoteTemplateBatchCompose:
         canvas["type"] = "page"
         canvas["layers"] = [layer]
         canvas["templateRules"] = {layer.get("name", ""): rules}
-        canvas.setdefault("colorPalette", [])
 
-        preview = self._compose_remote(layer, rules, input_values, item, config)
+        palette_key, palette = self._get_palette(template_data)
+        preview = self._compose_remote(layer, rules, input_values, palette_key, palette, item, config)
 
         result = {
             "workId": work_id,
@@ -220,18 +217,22 @@ class RemoteTemplateBatchCompose:
             "filename": preview["filename"],
             "width": preview["width"],
             "height": preview["height"],
-            "value": canvas,
+            # 远端返回的结果 page JSON 优先，Mock/未返回时用本地拼装的画布
+            "value": preview.get("canvas") or canvas,
         }
         return result
 
-    def _compose_remote(self, layer, rules, input_values, item, config):
-        """调用远端套版服务合成预览图。
+    def _compose_remote(self, layer, rules, input_values, palette_key, color_palette, item, config):
+        """调用远端套版服务完成替换与合图。
 
         请求 `POST {base_url}/open/api/agent/v1/template/replace`：
-        - templateJson: 替换完成的模板（字符串化 JSON）
+        - templateJson: 模板（字符串化 JSON）
         - rulesJson: 以节点 ID 为键的规则映射，附带 frameId（字符串化 JSON）
         - materialJson: 字段名 -> 表格值（字符串化 JSON）
+        - colorPaletteJson: 模板的配方数组（可选，模板未带配方时不传该字段）
 
+        响应 `data.url` 为预览图，`data.templateJson` 为替换完成的 frame 协议
+        （或整页 page JSON），`data.colorPaletteJson` 为原样带回的配方数组（可选）。
         base_url 为空时返回 Mock 固定测试图，方便本地调试。
         """
         work_id = item.get("workId") or f"work_{uuid.uuid4().hex[:8]}"
@@ -265,6 +266,9 @@ class RemoteTemplateBatchCompose:
             "storeType": config.get("store_type") or "oss",
             "templateJson": json.dumps(layer, ensure_ascii=False),
         }
+        # colorPaletteJson 非必填，模板未带配方时不传
+        if color_palette is not None:
+            request_body["colorPaletteJson"] = json.dumps(color_palette, ensure_ascii=False)
 
         # 合并顺序：默认头 -> 自定义头 -> Bearer Token；
         # auth_token 非空时 Authorization 以 auth_token 为准
@@ -300,6 +304,17 @@ class RemoteTemplateBatchCompose:
         if not preview.get("url"):
             raise RuntimeError(f"套版服务未返回预览图 URL: {self._snippet(response.text)}")
 
+        # data.templateJson 是替换完成的结果（frame 协议或整页 page）；
+        # data.colorPaletteJson 非必填，未返回时沿用模板自带的配方
+        canvas = self._build_result_canvas(
+            self._parse_json_field(payload, "templateJson"),
+            self._parse_optional_palette(payload),
+            layer,
+            rules,
+            palette_key,
+            color_palette,
+        )
+
         # 尺寸缺失时回退到模板根节点尺寸
         width = preview.get("width") or self._as_int(layer.get("width")) or self.MOCK_PREVIEW_WIDTH
         height = preview.get("height") or self._as_int(layer.get("height")) or self.MOCK_PREVIEW_HEIGHT
@@ -308,7 +323,82 @@ class RemoteTemplateBatchCompose:
             "filename": preview.get("filename") or fallback_filename,
             "width": width,
             "height": height,
+            "canvas": canvas,
         }
+
+    @staticmethod
+    def _get_palette(template_data):
+        """读取模板的配方字段，兼容 colorPalette / colorPalettes 两种命名。
+
+        返回 (使用的键名, 配方值)；两者都没有时返回 (默认键名, None)。
+        """
+        for key in ("colorPalette", "colorPalettes"):
+            if key in template_data:
+                return key, template_data[key]
+        return "colorPalette", None
+
+    @classmethod
+    def _parse_optional_palette(cls, payload):
+        """解析响应中的配方字段（非必填），兼容单复数命名；解析不了就当作未返回"""
+        if not isinstance(payload, dict):
+            return None
+        for key in ("colorPaletteJson", "colorPalettesJson", "colorPalette", "colorPalettes"):
+            if key not in payload:
+                continue
+            try:
+                parsed = cls._parse_json_field(payload, key)
+            except RuntimeError as e:
+                print(f"[RemoteTemplateBatchCompose] 忽略无法解析的 {key}: {str(e)}")
+                return None
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _parse_json_field(payload, key):
+        """解析响应中的字符串化 JSON 字段，缺失或为空时返回 None"""
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get(key)
+        if value is None or value == "":
+            return None
+        if isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"套版服务返回的 {key} 解析失败: {str(e)}")
+        raise RuntimeError(f"套版服务返回的 {key} 类型不支持: {type(value).__name__}")
+
+    @staticmethod
+    def _build_result_canvas(result_root, result_palette, layer, rules, palette_key, local_palette):
+        """把远端返回的结果组装成可编辑画布（最外层 type 为 page）。
+
+        远端 templateJson 既可能是替换后的 frame 协议，也可能已是整页 page；
+        配方优先用远端带回的，其次回退模板自带的，都没有时不写该字段
+        （colorPalette / colorPalettes 均为可选，沿用入参使用的命名）。
+        """
+        if not isinstance(result_root, dict):
+            # 远端未返回结果，交由调用方使用本地兜底画布
+            return None
+
+        palette = result_palette if result_palette is not None else local_palette
+
+        if result_root.get("type") == "page":
+            canvas = result_root
+            canvas.setdefault("templateRules", {layer.get("name", ""): rules})
+        else:
+            # frame / template 根：包装成 page，规则沿用替换后的节点 ID
+            canvas = {
+                "type": "page",
+                "layers": [result_root],
+                "templateRules": {result_root.get("name") or layer.get("name", ""): rules},
+            }
+
+        if palette is not None:
+            canvas[palette_key] = palette
+        return canvas
 
     def _extract_preview_info(self, payload):
         """从响应中提取预览图信息，兼容字符串 URL 与常见字段命名"""
