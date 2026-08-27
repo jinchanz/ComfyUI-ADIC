@@ -175,26 +175,14 @@ class RemoteTemplateBatchCompose:
         # 为模板根节点及所有子节点生成全局唯一的新 ID
         id_mapping = self._regenerate_ids(layer)
 
-        # 根据规则替换数据并更新规则中引用的 ID；
-        # 规则完整保留（包括 comfyConfig 等字段），只更新其中的节点 ID。
-        # 存在 comfyConfig 时当前不做 AI 调用，同样把当前表格值当作 Mock 结果写入。
-        for field_name, rule in rules.items():
-            new_id = id_mapping[rule["id"]]
-            rule["id"] = new_id
+        # 只更新规则中引用的节点 ID，规则其余字段（含 comfyConfig）完整保留。
+        # 值替换由远端按 materialJson 完成，节点内不做本地替换：
+        # 既避免对不认识的节点类型写错字段，也不会因类型不在白名单而报错。
+        for rule in rules.values():
+            rule["id"] = id_mapping[rule["id"]]
 
-            if field_name not in input_values:
-                continue
-            value = input_values[field_name]
-            node = self._find_nodes_by_id(layer, new_id)[0]
-            if rule.get("type") == "text":
-                node["content"] = value
-            elif rule.get("type") == "image":
-                node["src"] = value
-            else:
-                raise ValueError(f"规则 '{field_name}' 类型 '{rule.get('type')}' 不支持替换")
-
-        # 本地拼装的画布仅作兜底：最外层 type 为 page，模板放入 layers；
-        # 远端返回结果 templateJson 时以远端为准。
+        # 本地拼装的画布仅作兜底（Mock 或远端未返回 templateJson 时使用），
+        # 其中的节点值仍是模板默认值；远端返回结果时以远端为准。
         # colorPalette / colorPalettes 是可选字段，原样透传，缺失时不补默认值
         canvas = {
             key: copy.deepcopy(value)
