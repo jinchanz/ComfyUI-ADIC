@@ -1,4 +1,5 @@
 from .nodes_ai_generation import ADICOpenAIGPTImage1, IdeaLabImageGenerate
+from .nodes_byok import AigcByokDecryptNode
 from .nodes_api_basic import (
     ADIC_COMMON_API,
     ImageTranslateAPI,
@@ -36,6 +37,7 @@ NODE_CLASS_MAPPINGS = {
     "ADICOpenAIGPTImage1": ADICOpenAIGPTImage1,
     "IdeaLabImageGenerate": IdeaLabImageGenerate,
     "RemoteTemplateBatchCompose": RemoteTemplateBatchCompose,
+    "AigcByokDecrypt": AigcByokDecryptNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -56,4 +58,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADICOpenAIGPTImage1": "ADIC OpenAIGPTImage1",
     "IdeaLabImageGenerate": "IdeaLab Image Generate",
     "RemoteTemplateBatchCompose": "批量套版（远端合成）",
+    "AigcByokDecrypt": "AIGC BYOK 密钥解密",
 }

@@ -5,12 +5,24 @@ import uuid
 
 import requests
 
+from . import template_workflow
+from .template_workflow import WorkflowProtocolError
+from .tool_task_client import ToolTaskClient, ToolTaskError
+
+
+# 工具任务接口的 surface（场景标识）：服务端不做枚举校验，仅用于场景路由 / 频控 / 落库归类
+DEFAULT_TOOL_SURFACE = "template_compose"
+
 
 class RemoteTemplateBatchCompose:
     """批量套版节点
 
     接收一份模板 JSON 和多条表格数据，为每条数据生成预览图 URL 和
     可重新打开编辑的画布 JSON（最外层 type 为 page）。
+
+    规则含非空 `workflows` 时（templateProtocolVersion = 2），先在合图前执行
+    AI hook：解析工作流参数、调用工具任务接口、把结果写回 `input[resultRuleKey]`，
+    再把 resolvedInput 交给原有替换/合图链路。没有 workflows 的模板完全走旧链路。
 
     模板替换在本地完成；预览图通过远端套版服务
     `POST {base_url}/open/api/agent/v1/template/replace` 合成。
@@ -48,6 +60,28 @@ class RemoteTemplateBatchCompose:
                                    "与 Bearer Token 合并，auth_token 非空时 Authorization 以 auth_token 为准",
                     },
                 ),
+                "tool_base_url": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "工具任务服务基础地址，留空时回退 base_url；两者都为空时跳过 AI hook（Mock 调试）",
+                    },
+                ),
+                "tool_call_context": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "工具任务提交体上下文（JSON 对象），原样透传，例如 "
+                                   "{\"surface\": \"...\", \"agentId\": \"...\", \"sessionId\": \"...\"}；"
+                                   "requestId 与 toolCall 由节点填充",
+                    },
+                ),
+                "tool_poll_interval": ("INT", {"default": 5, "min": 1, "max": 60, "tooltip": "工具任务轮询间隔（秒）"}),
+                "tool_max_poll_time": (
+                    "INT",
+                    {"default": 600, "min": 10, "max": 3600, "tooltip": "单个工具任务最长轮询时间（秒）"},
+                ),
             },
         }
 
@@ -68,6 +102,10 @@ class RemoteTemplateBatchCompose:
         store_type="oss",
         timeout=300,
         extra_headers="",
+        tool_base_url="",
+        tool_call_context="",
+        tool_poll_interval=5,
+        tool_max_poll_time=600,
     ):
         config = {
             "base_url": (base_url or "").strip(),
@@ -79,6 +117,10 @@ class RemoteTemplateBatchCompose:
             "timeout": timeout or 300,
             # 节点级配置错误直接抛错，使本次工作流失败
             "extra_headers": self._parse_extra_headers(extra_headers),
+            "tool_base_url": (tool_base_url or "").strip(),
+            "tool_call_context": self._parse_tool_call_context(tool_call_context),
+            "tool_poll_interval": tool_poll_interval or 5,
+            "tool_max_poll_time": tool_max_poll_time or 600,
         }
 
         # templateJson / itemsJson 本身无法解析时直接报错，使本次工作流失败
@@ -102,10 +144,19 @@ class RemoteTemplateBatchCompose:
         template_error = None
         try:
             self._validate_template(template_data)
+        except WorkflowProtocolError as e:
+            template_error = (e.code, e.message, e.location)
         except ValueError as e:
-            template_error = str(e)
-            print(f"[RemoteTemplateBatchCompose] 模板校验失败: {template_error}")
+            template_error = ("TEMPLATE_INVALID", str(e), {})
+        if template_error is not None:
+            print(f"[RemoteTemplateBatchCompose] 模板校验失败: {template_error[0]} {template_error[1]}")
 
+        executor = None
+        if template_error is None and template_workflow.has_ai_rules(template_data.get("templateRules") or {}):
+            executor = self._build_tool_executor(config)
+
+        # 同一 workId 内有效输入相同的 AI 节点复用同一次执行结果
+        ai_cache = {}
         results = []
         for index, item in enumerate(items):
             if not isinstance(item, dict):
@@ -113,12 +164,18 @@ class RemoteTemplateBatchCompose:
                 continue
 
             if template_error is not None:
-                results.append(self._failed_result(item, "TEMPLATE_INVALID", template_error))
+                results.append(self._failed_result(item, template_error[0], template_error[1], template_error[2]))
                 continue
 
             # 单条失败只返回该条失败，不影响其他数据
             try:
-                results.append(self._compose_one(template_data, item, config))
+                results.append(self._compose_one(template_data, item, config, executor, ai_cache))
+            except WorkflowProtocolError as e:
+                print(f"[RemoteTemplateBatchCompose] 第 {index + 1} 条 AI 解析失败: {e.code} {e.message}")
+                results.append(self._failed_result(item, e.code, e.message, e.location))
+            except ToolTaskError as e:
+                print(f"[RemoteTemplateBatchCompose] 第 {index + 1} 条 AI 执行失败: {e.code} {e.message}")
+                results.append(self._failed_result(item, e.code, e.message))
             except Exception as e:
                 print(f"[RemoteTemplateBatchCompose] 第 {index + 1} 条套版失败: {str(e)}")
                 traceback.print_exc()
@@ -127,6 +184,30 @@ class RemoteTemplateBatchCompose:
         print(f"[RemoteTemplateBatchCompose] 处理完成: 共 {len(results)} 条，"
               f"成功 {sum(1 for r in results if r.get('status') == 'SUCCESS')} 条")
         return (json.dumps(results, ensure_ascii=False),)
+
+    def _build_tool_executor(self, config):
+        """构建工具任务执行器；地址为空时返回 None，沿用 Mock 调试链路"""
+        tool_base_url = config.get("tool_base_url") or config.get("base_url") or ""
+        if not tool_base_url:
+            print("[RemoteTemplateBatchCompose] 未配置工具任务地址，跳过 AI hook，直接使用行数据中的原值")
+            return None
+
+        context = dict(config.get("tool_call_context") or {})
+        if not str(context.get("surface") or "").strip():
+            context["surface"] = DEFAULT_TOOL_SURFACE
+        # 服务端按 agentId 校验工具绑定关系（public_share 例外，由 shareToken 反查）
+        if context["surface"] != "public_share" and not str(context.get("agentId") or "").strip():
+            raise ValueError("tool_call_context 缺少 agentId，工具任务接口需要它校验工具绑定关系")
+
+        return ToolTaskClient(
+            base_url=tool_base_url,
+            headers=self._build_headers(config),
+            context=context,
+            poll_interval=config.get("tool_poll_interval"),
+            max_poll_time=config.get("tool_max_poll_time"),
+            timeout=config.get("timeout"),
+            log_prefix="[RemoteTemplateBatchCompose]",
+        )
 
     def _validate_template(self, template_data):
         """校验模板结构与 templateRules 的一致性"""
@@ -161,12 +242,25 @@ class RemoteTemplateBatchCompose:
                 )
             # 规则键与节点 columnName 的一致性不在本地校验，由远端接口负责
 
-    def _compose_one(self, template_data, item, config):
+        # 含非空 workflows 时按第 2 版协议校验；老模板此处直接返回
+        template_workflow.validate_workflows(template_data, layer)
+
+    def _compose_one(self, template_data, item, config, executor=None, ai_cache=None):
         """处理单条数据，返回成功结果"""
         work_id = item.get("workId")
         input_values = item.get("input") or {}
         if not isinstance(input_values, dict):
             raise ValueError("input 必须是 JSON 对象")
+
+        # 忽略存量数据泄漏在 input 中的路由/执行上下文 key
+        resolved_input = template_workflow.strip_reserved_keys(input_values)
+
+        # AI hook 在旧替换逻辑之前，且必须在原始图层 ID 上解析 binding.layerId
+        generated = {}
+        if executor is not None:
+            resolved_input, generated = self._run_ai_hook(
+                template_data, resolved_input, item, executor, ai_cache if ai_cache is not None else {}
+            )
 
         # 深拷贝模板，不修改原始模板
         layer = copy.deepcopy(template_data["layer"])
@@ -175,11 +269,10 @@ class RemoteTemplateBatchCompose:
         # 为模板根节点及所有子节点生成全局唯一的新 ID
         id_mapping = self._regenerate_ids(layer)
 
-        # 只更新规则中引用的节点 ID，规则其余字段（含 comfyConfig）完整保留。
-        # 值替换由远端按 materialJson 完成，节点内不做本地替换：
+        # 只更新规则中引用的节点 ID（含 workflows 内的 binding.layerId），
+        # 规则其余字段完整保留。值替换由远端按 materialJson 完成，节点内不做本地替换：
         # 既避免对不认识的节点类型写错字段，也不会因类型不在白名单而报错。
-        for rule in rules.values():
-            rule["id"] = id_mapping[rule["id"]]
+        template_workflow.remap_rule_layer_ids(rules, id_mapping)
 
         # 本地拼装的画布仅作兜底（Mock 或远端未返回 templateJson 时使用），
         # 其中的节点值仍是模板默认值；远端返回结果时以远端为准。
@@ -194,7 +287,7 @@ class RemoteTemplateBatchCompose:
         canvas["templateRules"] = {layer.get("name", ""): rules}
 
         palette_key, palette = self._get_palette(template_data)
-        preview = self._compose_remote(layer, rules, input_values, palette_key, palette, item, config)
+        preview = self._compose_remote(layer, rules, resolved_input, palette_key, palette, item, config)
 
         result = {
             "workId": work_id,
@@ -208,7 +301,63 @@ class RemoteTemplateBatchCompose:
             # 远端返回的结果 page JSON 优先，Mock/未返回时用本地拼装的画布
             "value": preview.get("canvas") or canvas,
         }
+        if generated:
+            result["generated"] = generated
         return result
+
+    def _run_ai_hook(self, template_data, input_values, item, executor, ai_cache):
+        """按依赖顺序执行 workflows，把 AI 结果写入行数据，返回 (resolvedInput, generated)"""
+        rules = template_data["templateRules"]
+        layer_index, _ = template_workflow.index_layers(template_data["layer"])
+        work_id = item.get("workId") or ""
+
+        generated_patch = {}
+        generated_meta = {}
+
+        for result_rule_key in template_workflow.build_execution_order(rules):
+            workflow = template_workflow.get_workflow(rules, result_rule_key)
+            workflow_key = workflow.get("workflowKey")
+            tool_name = workflow.get("toolName")
+
+            params = template_workflow.resolve_workflow_params(
+                rules, layer_index, input_values, result_rule_key, generated_patch
+            )
+            input_hash = template_workflow.effective_input_hash(workflow, params)
+            cache_key = (work_id, tool_name, input_hash)
+
+            cached = ai_cache.get(cache_key)
+            if cached is not None:
+                value, execution_id = cached
+                reused = True
+                print(f"[RemoteTemplateBatchCompose] 复用 AI 结果: {result_rule_key} "
+                      f"(workId: {work_id}, inputHash: {input_hash[:12]})")
+            else:
+                # 幂等身份: workId + resultRuleKey + workflowKey + effectiveInputHash
+                request_id = f"{work_id}:{result_rule_key}:{workflow_key}:{input_hash[:16]}"
+                task_result = executor.call_tool(tool_name, params, request_id)
+                value = template_workflow.select_workflow_output(
+                    task_result.get("data") or {},
+                    workflow["output"],
+                    rules[result_rule_key].get("type"),
+                    result_rule_key,
+                    workflow_key,
+                )
+                execution_id = task_result.get("taskId") or task_result.get("publicId") or ""
+                ai_cache[cache_key] = (value, execution_id)
+                reused = False
+
+            generated_patch[result_rule_key] = value
+            generated_meta[result_rule_key] = [
+                {
+                    "workflowKey": workflow_key,
+                    "executionId": execution_id,
+                    "inputHash": input_hash,
+                    "value": value,
+                    "reused": reused,
+                }
+            ]
+
+        return template_workflow.resolve_compose_input(input_values, generated_patch), generated_meta
 
     def _compose_remote(self, layer, rules, input_values, palette_key, color_palette, item, config):
         """调用远端套版服务完成替换与合图。
@@ -260,14 +409,7 @@ class RemoteTemplateBatchCompose:
 
         # 合并顺序：默认头 -> 自定义头 -> Bearer Token；
         # auth_token 非空时 Authorization 以 auth_token 为准
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "*/*",
-        }
-        headers.update(config.get("extra_headers") or {})
-        auth_token = config.get("auth_token") or ""
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
+        headers = self._build_headers(config)
 
         url = base_url.rstrip("/") + self.REPLACE_API_PATH
         print(f"[RemoteTemplateBatchCompose] 调用套版服务: {url} (workId: {work_id})")
@@ -417,6 +559,37 @@ class RemoteTemplateBatchCompose:
         }
 
     @staticmethod
+    def _build_headers(config):
+        """合并顺序：默认头 -> 自定义头 -> Bearer Token；
+        auth_token 非空时 Authorization 以 auth_token 为准
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+        }
+        headers.update(config.get("extra_headers") or {})
+        auth_token = config.get("auth_token") or ""
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        return headers
+
+    @staticmethod
+    def _parse_tool_call_context(tool_call_context):
+        """解析工具任务提交体上下文，requestId 和 toolCall 由节点填充，不允许覆盖"""
+        text = (tool_call_context or "").strip()
+        if not text:
+            return {}
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"tool_call_context JSON 解析失败: {str(e)}")
+        if not isinstance(parsed, dict):
+            raise ValueError("tool_call_context 必须是 JSON 对象")
+
+        return {key: value for key, value in parsed.items() if key not in ("requestId", "toolCall")}
+
+    @staticmethod
     def _parse_extra_headers(extra_headers):
         """解析自定义请求头，支持 JSON 对象或每行一条 'Key: Value'"""
         text = (extra_headers or "").strip()
@@ -496,8 +669,8 @@ class RemoteTemplateBatchCompose:
         walk(root)
         return found
 
-    def _failed_result(self, item, error_code, error_message):
-        return {
+    def _failed_result(self, item, error_code, error_message, location=None):
+        result = {
             "workId": item.get("workId"),
             "rowNo": item.get("rowNo"),
             "attempt": item.get("attempt"),
@@ -505,3 +678,8 @@ class RemoteTemplateBatchCompose:
             "errorCode": error_code,
             "errorMessage": error_message,
         }
+        # 能定位时附带 resultRuleKey / workflowKey / inputKey / layerId / parameterPath
+        for key, value in (location or {}).items():
+            if key not in result:
+                result[key] = value
+        return result
