@@ -4,8 +4,8 @@
 
     Base64(12 字节 IV + AES-256-GCM 密文 + 16 字节 auth tag)
 
-共享 32 字节 AES 密钥只从环境变量 ``AIGC_BYOK_ENCRYPTION_KEY`` 读取，
-不接受工作流入参，避免密钥被持久化进 workflow JSON。
+共享 32 字节 AES 密钥默认从环境变量 ``AIGC_BYOK_ENCRYPTION_KEY`` 读取，
+也可由调用方显式传入 64 位十六进制密钥。
 
 依赖: pip install cryptography
 """
@@ -57,9 +57,10 @@ def _parse_key(key_hex: str) -> bytes:
     return key
 
 
-def is_key_configured() -> bool:
-    """共享密钥是否已配置（不暴露密钥内容）。"""
-    return bool((os.getenv(KEY_ENV_NAME) or "").strip())
+def is_key_configured(key_hex: Optional[str] = None) -> bool:
+    """共享密钥是否已显式传入或通过环境变量配置（不暴露密钥内容）。"""
+    configured_key = key_hex if key_hex is not None else os.getenv(KEY_ENV_NAME, "")
+    return bool((configured_key or "").strip())
 
 
 def looks_like_encrypted_ak(value: str) -> bool:
@@ -125,7 +126,12 @@ def decrypt_encrypted_ak(encrypted_ak: str, key_hex: Optional[str] = None) -> st
         raise EncryptedAkError("encryptedAk plaintext is not valid UTF-8") from exc
 
 
-def resolve_ak(value: str, mode: str = "auto", log_prefix: str = "BYOK") -> str:
+def resolve_ak(
+    value: str,
+    mode: str = "auto",
+    log_prefix: str = "BYOK",
+    key_hex: Optional[str] = None,
+) -> str:
     """把节点入参里的 ak 归一成明文，供 Authorization: Bearer 使用。
 
     同一个入参既可以是用户明文 ak，也可以是 BYOK 密文：
@@ -134,6 +140,7 @@ def resolve_ak(value: str, mode: str = "auto", log_prefix: str = "BYOK") -> str:
     - ``plaintext``：完全不解密，原样使用；
     - ``encrypted``：强制解密，失败即抛错（便于暴露密钥配置问题）。
 
+    ``key_hex`` 非空时优先使用显式密钥，否则读取环境变量。
     日志只输出判定结果，不输出 ak、密钥或明文本身。
     """
     text = (value or "").strip()
@@ -145,7 +152,7 @@ def resolve_ak(value: str, mode: str = "auto", log_prefix: str = "BYOK") -> str:
         return text
 
     if normalized_mode == "encrypted":
-        plaintext = decrypt_encrypted_ak(text)
+        plaintext = decrypt_encrypted_ak(text, key_hex)
         print(f"[{log_prefix}] encryptedAk 已解密（强制密文模式）")
         return plaintext
 
@@ -153,12 +160,12 @@ def resolve_ak(value: str, mode: str = "auto", log_prefix: str = "BYOK") -> str:
     if not looks_like_encrypted_ak(text):
         return text
 
-    if not is_key_configured():
-        print(f"[{log_prefix}] 入参形似 encryptedAk，但未配置 {KEY_ENV_NAME}，按明文使用")
+    if not is_key_configured(key_hex):
+        print(f"[{log_prefix}] 入参形似 encryptedAk，但未提供解密密钥，按明文使用")
         return text
 
     try:
-        plaintext = decrypt_encrypted_ak(text)
+        plaintext = decrypt_encrypted_ak(text, key_hex)
     except EncryptedAkError as exc:
         # 认证失败无法区分“密钥不对”与“恰好像 Base64 的明文 ak”，
         # 保守按明文继续，并给出可排查的提示（不含敏感内容）

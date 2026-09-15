@@ -82,6 +82,14 @@ class RemoteTemplateBatchCompose:
                     "INT",
                     {"default": 600, "min": 10, "max": 3600, "tooltip": "单个工具任务最长轮询时间（秒）"},
                 ),
+                "tool_batch_task_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "套版批量任务的计费 AIGC Record 公共 ID，由 Java 消息工厂注入为 workflow userParam；"
+                                   "透传给工具任务提交接口用于受托计费，切勿在此填写 AK",
+                    },
+                ),
             },
         }
 
@@ -106,6 +114,7 @@ class RemoteTemplateBatchCompose:
         tool_call_context="",
         tool_poll_interval=5,
         tool_max_poll_time=600,
+        tool_batch_task_id="",
     ):
         config = {
             "base_url": (base_url or "").strip(),
@@ -121,6 +130,7 @@ class RemoteTemplateBatchCompose:
             "tool_call_context": self._parse_tool_call_context(tool_call_context),
             "tool_poll_interval": tool_poll_interval or 5,
             "tool_max_poll_time": tool_max_poll_time or 600,
+            "tool_batch_task_id": (tool_batch_task_id or "").strip(),
         }
 
         # templateJson / itemsJson 本身无法解析时直接报错，使本次工作流失败
@@ -195,6 +205,10 @@ class RemoteTemplateBatchCompose:
         context = dict(config.get("tool_call_context") or {})
         if not str(context.get("surface") or "").strip():
             context["surface"] = DEFAULT_TOOL_SURFACE
+        # 套版批量任务的计费 Record 公共 ID：透传给提交接口用于受托计费（服务端仅对内部服务 AK 生效）
+        batch_task_id = str(config.get("tool_batch_task_id") or "").strip()
+        if batch_task_id:
+            context["templateBatchTaskId"] = batch_task_id
         # 服务端按 agentId 校验工具绑定关系（public_share 例外，由 shareToken 反查）
         if context["surface"] != "public_share" and not str(context.get("agentId") or "").strip():
             raise ValueError("tool_call_context 缺少 agentId，工具任务接口需要它校验工具绑定关系")
