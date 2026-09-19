@@ -188,30 +188,41 @@ def _as_list_index(token):
 
 
 def validate_workflows(template_data, layer_root):
-    """校验模板中的 workflows 配置，不合法时抛带协议错误码的异常"""
+    """校验模板中的 workflows 配置。
+
+    校验不通过时只记录告警、不抛出：避免整批因单个 workflow 配置问题而全部失败。
+    真正无法执行的条目仍会在执行期（build_execution_order / resolve_workflow_params /
+    select_workflow_output）被逐条捕获为该条失败，不影响其他条目。
+    无 AI 结果规则时直接返回。
+    """
     template_rules = template_data.get("templateRules") or {}
     result_keys = ai_result_keys(template_rules)
     if not result_keys:
         return
 
-    version = template_data.get("templateProtocolVersion")
-    if version != PROTOCOL_VERSION:
-        raise WorkflowProtocolError(
-            "TEMPLATE_INVALID",
-            f"存在非空 workflows 时 templateProtocolVersion 必须为 {PROTOCOL_VERSION}，当前为: {version!r}",
-        )
+    try:
+        version = template_data.get("templateProtocolVersion")
+        if version != PROTOCOL_VERSION:
+            raise WorkflowProtocolError(
+                "TEMPLATE_INVALID",
+                f"存在非空 workflows 时 templateProtocolVersion 必须为 {PROTOCOL_VERSION}，当前为: {version!r}",
+            )
 
-    layer_index, duplicated_ids = index_layers(layer_root)
-    result_key_set = set(result_keys)
+        layer_index, duplicated_ids = index_layers(layer_root)
+        result_key_set = set(result_keys)
 
-    for result_rule_key in result_keys:
-        workflow = get_workflow(template_rules, result_rule_key)
-        _validate_workflow(
-            workflow, result_rule_key, template_rules, result_key_set, layer_index, duplicated_ids
-        )
+        for result_rule_key in result_keys:
+            workflow = get_workflow(template_rules, result_rule_key)
+            _validate_workflow(
+                workflow, result_rule_key, template_rules, result_key_set, layer_index, duplicated_ids
+            )
 
-    # 依赖成环在这里暴露，避免执行时才失败
-    build_execution_order(template_rules)
+        # 依赖成环仅在此告警；执行期 build_execution_order 会再次检测并逐条失败
+        build_execution_order(template_rules)
+    except WorkflowProtocolError as e:
+        print(f"[template_workflow] workflows 校验告警（不阻断，执行期逐条校验）: {e.code} {e.message}")
+    except Exception as e:
+        print(f"[template_workflow] workflows 校验告警（不阻断，执行期逐条校验）: {e}")
 
 
 def _validate_workflow(workflow, result_rule_key, template_rules, result_key_set, layer_index, duplicated_ids):

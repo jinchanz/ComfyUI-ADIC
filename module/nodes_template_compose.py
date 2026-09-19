@@ -224,12 +224,17 @@ class RemoteTemplateBatchCompose:
         )
 
     def _validate_template(self, template_data):
-        """校验模板结构与 templateRules 的一致性"""
+        """校验模板结构。
+
+        仅保留会导致后续处理直接崩溃的结构性前置（layer / rules 必须是对象）
+        为硬错误；其余 rule 级校验（id、节点存在性、唯一性、类型一致性）一律降级为日志，
+        不阻断流程，具体合法性由远端接口负责。
+        """
         layer = template_data.get("layer")
         if not isinstance(layer, dict):
             raise ValueError("模板缺少 layer 对象")
         if layer.get("type") not in ("template", "frame"):
-            raise ValueError(f"layer.type 必须为 template 或 frame，当前为: {layer.get('type')}")
+            print(f"[RemoteTemplateBatchCompose] 模板校验告警: layer.type 建议为 template 或 frame，当前为: {layer.get('type')}")
 
         rules = template_data.get("templateRules")
         if not isinstance(rules, dict):
@@ -237,22 +242,25 @@ class RemoteTemplateBatchCompose:
 
         for field_name, rule in rules.items():
             if not isinstance(rule, dict):
-                raise ValueError(f"规则 '{field_name}' 必须是 JSON 对象")
+                print(f"[RemoteTemplateBatchCompose] 模板校验告警: 规则 '{field_name}' 不是 JSON 对象，已跳过校验")
+                continue
             rule_id = rule.get("id")
             rule_type = rule.get("type")
             if not rule_id:
-                raise ValueError(f"规则 '{field_name}' 缺少 id")
+                print(f"[RemoteTemplateBatchCompose] 模板校验告警: 规则 '{field_name}' 缺少 id")
+                continue
 
             nodes = self._find_nodes_by_id(layer, rule_id)
             if len(nodes) == 0:
-                raise ValueError(f"规则 '{field_name}' 引用的节点 '{rule_id}' 在模板中不存在")
+                print(f"[RemoteTemplateBatchCompose] 模板校验告警: 规则 '{field_name}' 引用的节点 '{rule_id}' 在模板中不存在")
+                continue
             if len(nodes) > 1:
-                raise ValueError(f"规则 '{field_name}' 引用的节点 '{rule_id}' 在模板中不唯一")
+                print(f"[RemoteTemplateBatchCompose] 模板校验告警: 规则 '{field_name}' 引用的节点 '{rule_id}' 在模板中不唯一")
 
             node = nodes[0]
             if node.get("type") != rule_type:
-                raise ValueError(
-                    f"规则 '{field_name}' 类型不一致: 规则为 '{rule_type}'，节点为 '{node.get('type')}'"
+                print(
+                    f"[RemoteTemplateBatchCompose] 模板校验告警: 规则 '{field_name}' 类型不一致: 规则为 '{rule_type}'，节点为 '{node.get('type')}'"
                 )
             # 规则键与节点 columnName 的一致性不在本地校验，由远端接口负责
 
