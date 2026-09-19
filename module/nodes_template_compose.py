@@ -407,13 +407,20 @@ class RemoteTemplateBatchCompose:
                 "height": self.MOCK_PREVIEW_HEIGHT,
             }
 
-        # rulesJson 以节点 ID 为键，保留规则原有字段（含 comfyConfig），补充 frameId
+        # rulesJson 以节点 ID 为键，保留规则原有字段（含 comfyConfig），补充 frameId。
+        # 仅带 id 的画布节点规则进入 rulesJson；纯行输入列（如 workflow 的 source=row 取值源列）
+        # 没有 id，不对应画布节点，其值通过 materialJson 传给远端，跳过即可，避免 KeyError。
         frame_id = layer.get("id")
         rules_payload = {}
-        for rule in rules.values():
+        for field_name, rule in rules.items():
+            if not isinstance(rule, dict):
+                continue
+            rule_id = rule.get("id")
+            if not rule_id:
+                continue
             rule_entry = dict(rule)
             rule_entry["frameId"] = frame_id
-            rules_payload[rule["id"]] = rule_entry
+            rules_payload[rule_id] = rule_entry
 
         request_body = {
             "appName": config.get("app_name") or "local",
