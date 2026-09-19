@@ -566,8 +566,13 @@ def _resolve_layer_value(
 
 
 def select_workflow_output(result_data, output, result_type, result_rule_key=None, workflow_key=None):
-    """按 output.key + itemIndex 从工具结果中选出最终值"""
-    output_key = output.get("key")
+    """按 output.key + itemIndex 从工具结果中选出最终值。
+
+    workflow 未声明 output 描述符（或缺少 key）时，默认取结果容器里的 "output"，
+    兼容 COMFY_APP 结果 outputs.output 的常见约定，避免因缺 output 描述符而整条失败。
+    """
+    output = output if isinstance(output, dict) else {}
+    output_key = output.get("key") or "output"
     item_index = output.get("itemIndex") or 0
 
     items = _locate_output_items(result_data, output_key)

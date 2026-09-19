@@ -359,7 +359,7 @@ class RemoteTemplateBatchCompose:
                 task_result = executor.call_tool(tool_name, params, request_id)
                 value = template_workflow.select_workflow_output(
                     task_result.get("data") or {},
-                    workflow["output"],
+                    workflow.get("output"),
                     rules[result_rule_key].get("type"),
                     result_rule_key,
                     workflow_key,
